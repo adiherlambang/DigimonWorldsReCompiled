@@ -14,7 +14,6 @@ dwrc-disc.workspace = true
 dwrc-psx.workspace = true
 dwrc-runtime.workspace = true
 dwrc-mods.workspace = true
-dwrc-modhub.workspace = true
 dwrc-net.workspace = true
 anyhow.workspace = true
 log.workspace = true

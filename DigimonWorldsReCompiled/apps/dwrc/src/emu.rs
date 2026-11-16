@@ -164,6 +164,9 @@ fn run(
     let mut speed = 1u32;
     let mut frame_n = 0u64;
     let mut map_filter = MapTransitionFilter::new(8);
+    // DWRC_MAP_DEBUG=1 logs every change of the raw map byte (to find what rewrites it).
+    let map_debug = std::env::var_os("DWRC_MAP_DEBUG").is_some();
+    let mut last_raw_map: u8 = 0xFF;
     let udp_sock = UdpSocket::bind("0.0.0.0:0").ok();
     if let Some(ref s) = udp_sock { let _ = s.set_nonblocking(true); }
     let mut seq_gen = proto::SeqGen::new();
@@ -216,10 +219,22 @@ fn run(
                     net.expire(Duration::from_secs(3));
                 }
             }
+            if map_debug {
+                let raw = dw1_ram::read_u8(&session.psx.bus.ram, dw1_ram::slus_01032::CURRENT_MAP_ID);
+                if raw != last_raw_map {
+                    map_debug_log(&format!(
+                        "frame {frame_n}: 0x{last_raw_map:02X} -> 0x{raw:02X} (calm={}, game_state={})",
+                        dw1_ram::is_calm(&session.psx.bus.ram),
+                        dw1_ram::read_u8(&session.psx.bus.ram, dw1_ram::slus_01032::GAME_STATE)
+                    ));
+                    last_raw_map = raw;
+                }
+            }
             let mut tf = dw1_ram::extract_player_transform(&session.psx.bus.ram, sess.tamer_id, &sess.tamer_name);
-            if let Some(stable_map) = map_filter.update(&tf) {
+            let calm = dw1_ram::is_calm(&session.psx.bus.ram);
+            if let Some(stable_map) = map_filter.update(&tf, calm) {
                 tf.map_id = stable_map;
-                let area = dw1_ram::map_id_to_name(stable_map);
+                let area = dw1_ram::area_name_for(&session.psx.bus.ram, stable_map);
                 if sess.is_online {
                     if let (Some(sock), Some((_, _, addr))) = (&udp_sock, &udp_target) {
                         let pkt = proto::pack_sync(&tf, sess.session_id, &sess.session_key, seq_gen.next());
@@ -281,4 +296,13 @@ fn run(
     }
     session.shutdown();
     sh.status.lock().unwrap().running = false;
+}
+
+/// Appends a line to `dwrc-map-debug.log` in the working directory. The Windows
+/// release build has no console, so `eprintln!` would be invisible there.
+fn map_debug_log(line: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("dwrc-map-debug.log") {
+        let _ = writeln!(f, "[map] {line}");
+    }
 }

@@ -8,9 +8,8 @@ mod app;
 mod audio;
 mod crt;
 mod emu;
-mod footer;
 mod input;
-mod mods_page;
+mod local_server;
 
 use eframe::egui;
 
@@ -45,7 +44,7 @@ fn main() -> eframe::Result<()> {
     let play_at = args.iter().position(|a| a == "--play");
     let autostart = play_at.and_then(|i| args.get(i + 1)).and_then(|s| dwrc_disc::GameId::from_slug(s));
     // Files passed on the command line (or dropped on the program's icon):
-    // mod .zip files are installed, disc images imported.
+    // disc images are imported, BIOS dumps added.
     let open_files: Vec<std::path::PathBuf> = args
         .iter()
         .enumerate()

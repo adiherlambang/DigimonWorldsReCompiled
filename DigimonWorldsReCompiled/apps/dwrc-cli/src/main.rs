@@ -837,31 +837,6 @@ fn mod_cmd(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
-        Some("index") => {
-            let src = dwrc_modhub::index::resolve_source(&arg(1, "index")?).map_err(|e| anyhow::anyhow!(e))?;
-            let hub = dwrc_modhub::Hub::new(std::env::temp_dir().join("dwrc-cli-modhub"));
-            let f = hub.fetch_index(&src, true);
-            println!("feed: {}", src.feed);
-            if let Some(e) = &f.error {
-                println!("error: {e}");
-            }
-            for e in f.index.map(|i| i.mods).unwrap_or_default() {
-                println!("{:<24} v{:<10} {:<10} {}", e.id, e.display_version(), e.games.join(","), e.install_url().unwrap_or_else(|w| format!("({w})")));
-            }
-            Ok(())
-        }
-        Some("releases") => {
-            let repo = dwrc_mods::parse_github_repo(&arg(1, "owner/repo")?).context("not a GitHub repository")?;
-            let hub = dwrc_modhub::Hub::new(std::env::temp_dir().join("dwrc-cli-modhub"));
-            let f = hub.fetch_releases(&repo, &arg(2, "mod id")?, true);
-            if let Some(e) = &f.error {
-                println!("error: {e}");
-            }
-            for r in &f.releases {
-                println!("v{:<10} {:<11} {}{}", r.version, r.published.as_deref().unwrap_or(""), r.zip.name, if r.prerelease { "  (pre-release)" } else { "" });
-            }
-            Ok(())
-        }
-        _ => bail!("mod commands: validate, pack, install, list, index, releases"),
+        _ => bail!("mod commands: validate, pack, install, list"),
     }
 }

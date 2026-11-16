@@ -7,7 +7,6 @@ members = [
     "crates/dwrc-recomp",
     "crates/dwrc-mods",
     "crates/dwrc-runtime",
-    "crates/dwrc-modhub",
     "crates/dwrc-net",
     "apps/dwrc",
     "apps/dwrc-cli",
@@ -28,7 +27,6 @@ dwrc-psx = { path = "crates/dwrc-psx" }
 dwrc-recomp = { path = "crates/dwrc-recomp" }
 dwrc-mods = { path = "crates/dwrc-mods" }
 dwrc-runtime = { path = "crates/dwrc-runtime" }
-dwrc-modhub = { path = "crates/dwrc-modhub" }
 dwrc-net = { path = "crates/dwrc-net" }
 
 anyhow = "1"

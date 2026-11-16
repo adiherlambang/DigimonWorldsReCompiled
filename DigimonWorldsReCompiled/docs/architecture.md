@@ -21,7 +21,6 @@ Gen1Recomp's *product* ideas are kept: one launcher, hash-verified player-suppli
 | `dwrc-psx` | The console: bus, CPU + COP0 + reference interpreter, GTE, GPU, SPU, CD-ROM, MDEC, DMA, timers, interrupt controller, SIO (pads, memory cards). |
 | `dwrc-recomp` | Static recompiler (Cranelift), block cache, invalidation, validation. |
 | `dwrc-mods` | Mod manifests, discovery and load planning (games, dependencies, conflicts), `.zip` install/uninstall/pack, virtual-disc file replacement, memory patches, sandboxed Lua scripting. |
-| `dwrc-modhub` | Mod indexes (GitHub-hosted feeds), update checks against mods' GitHub Releases, downloads; caching and offline fallback. |
 | `dwrc-runtime` | Paths/portable mode, library import + verification, BIOS identification, settings, play sessions. |
 | `dwrc` | Launcher and player (egui/eframe, cpal audio, gilrs gamepads). |
 | `dwrc-cli` | Developer tools (inspect discs, run headless, screenshots, validation, disassembly). |

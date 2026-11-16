@@ -4,7 +4,6 @@ use crate::audio::{self, AudioOut, AudioShared};
 use crate::emu::{EmuCmd, EmuHandle};
 use crate::input::{self, Input};
 use dwrc_disc::GameId;
-use crate::mods_page::{ModsUi, Tab};
 use dwrc_psx::Button;
 use dwrc_runtime::bios::region_label;
 use dwrc_runtime::config::{Aspect, BiosMode, EngineKind, Filter, Widescreen};
@@ -31,7 +30,6 @@ pub(crate) const MUTED: Color32 = Color32::from_rgb(150, 156, 168);
 enum Screen {
     Login,
     Library,
-    Mods,
     Settings,
     Playing,
 }
@@ -53,6 +51,7 @@ pub struct App {
     cfg: Config,
     screen: Screen,
     emu: Option<EmuHandle>,
+    local_server: crate::local_server::LocalServer,
     audio: Arc<AudioShared>,
     _audio_out: Option<AudioOut>,
     audio_error: Option<String>,
@@ -64,14 +63,11 @@ pub struct App {
     job: Option<Job>,
     toast: Option<(String, Instant, bool)>,
     show_pause: bool,
-    show_mods_overlay: bool,
     rebinding: Option<Button>,
     fullscreen: bool,
-    mods_ui: ModsUi,
     autostart: Option<GameId>,
     files_hovering: bool,
     open_files: Vec<std::path::PathBuf>,
-    updater: crate::footer::Updater,
     /// The CRT filter (None when OpenGL 3 shaders are unavailable).
     crt: Option<Arc<crate::crt::Crt>>,
     crt_error: Option<String>,
@@ -109,8 +105,6 @@ impl App {
         if fullscreen {
             cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
         }
-        let mods_ui = ModsUi::new(&paths);
-        let updater = crate::footer::Updater::new(&paths, cfg.updates.check_on_start);
         let (crt, crt_error) = match cc.gl.as_ref().map(|gl| crate::crt::Crt::new(gl)) {
             Some(Ok(c)) => (Some(Arc::new(c)), None),
             Some(Err(e)) => {
@@ -120,8 +114,6 @@ impl App {
             None => (None, Some("needs the OpenGL renderer".to_string())),
         };
         Self {
-            mods_ui,
-            updater,
             crt,
             crt_error,
             library_h: 0.0,
@@ -142,6 +134,7 @@ impl App {
             cfg,
             screen: Screen::Login,
             emu: None,
+            local_server: crate::local_server::LocalServer::start(),
             audio,
             _audio_out: audio_out,
             audio_error,
@@ -153,7 +146,6 @@ impl App {
             job: None,
             toast: None,
             show_pause: false,
-            show_mods_overlay: false,
             rebinding: None,
             fullscreen,
             autostart,
@@ -194,8 +186,6 @@ impl App {
         self.overlays.clear();
         self.last_seq = 0;
         self.show_pause = false;
-        self.show_mods_overlay = false;
-        self.mods_ui.changed_while_running = false;
         self.screen = Screen::Playing;
     }
 
@@ -355,26 +345,12 @@ impl App {
                             self.stop_game();
                             self.screen = Screen::Login;
                         }
-                        let mod_updates = self.mods_ui.update_count();
-                        for (screen, label) in [(Screen::Settings, "⚙ Settings"), (Screen::Mods, "Mods"), (Screen::Library, "▶ Games")] {
+                        for (screen, label) in [(Screen::Settings, "⚙ Settings"), (Screen::Library, "▶ Games")] {
                             let sel = self.screen == screen;
                             let txt = RichText::new(label).size(16.0).strong().color(if sel { Color32::WHITE } else { MUTED });
                             let b = egui::Button::new(txt).fill(if sel { ACCENT_DIM } else { Color32::TRANSPARENT }).min_size(Vec2::new(96.0, 30.0));
-                            let mut r = ui.add(b);
-                            if screen == Screen::Mods && mod_updates > 0 {
-                                // A count of mods with updates, beside the label.
-                                let c = egui::pos2(r.rect.center().x + 33.0, r.rect.center().y);
-                                ui.painter().circle(c, 9.0, crate::footer::UPDATE_FILL, Stroke::new(1.5_f32, PANEL_BG));
-                                let n = if mod_updates > 9 { "9+".to_string() } else { mod_updates.to_string() };
-                                ui.painter().text(c, Align2::CENTER_CENTER, n, egui::FontId::proportional(12.0), Color32::WHITE);
-                                let s = if mod_updates == 1 { "1 mod has an update" } else { "mods have updates" };
-                                r = r.on_hover_text(if mod_updates == 1 { s.to_string() } else { format!("{mod_updates} {s}") });
-                            }
-                            if r.clicked() {
+                            if ui.add(b).clicked() {
                                 self.screen = screen;
-                                if screen == Screen::Mods && mod_updates > 0 {
-                                    self.mods_ui.tab = Tab::Installed;
-                                }
                             }
                         }
                     });
@@ -384,9 +360,6 @@ impl App {
 
     fn library_screen(&mut self, ctx: &egui::Context) {
         self.top_bar(ctx);
-        if let Some(m) = crate::footer::footer(ctx, &mut self.updater) {
-            self.notify(m, true);
-        }
         egui::CentralPanel::default().frame(egui::Frame::default().fill(Color32::from_rgb(13, 14, 18)).inner_margin(24.0)).show(ctx, |ui| {
             let none_imported = self.lib.games.is_empty();
             let page = ui.available_rect_before_wrap();
@@ -418,7 +391,6 @@ impl App {
                 }
                 // Cards: three across, as large as the page allows (by width
                 // and by height), centred; one column on narrow windows.
-                let gap = 24.0;
                 let avail = ui.available_width();
                 let used_above = ui.cursor().top() - top;
                 let below = if none_imported { 0.0 } else { 70.0 };
@@ -459,10 +431,6 @@ impl App {
         let status = self.lib.status(g);
         let entry = self.lib.games.get(&g).cloned();
         let thumb = self.thumbnail(ctx, g);
-        let enabled_mods = {
-            let env = crate::mods_page::Env { cfg: &mut self.cfg, paths: &self.paths, lib: &self.lib, running: None };
-            self.mods_ui.active_count(&env, g)
-        };
         // Text and buttons grow a little with the card.
         let k = (w / 400.0).clamp(1.0, 1.3);
         egui::Frame::default().fill(CARD_BG).corner_radius(10.0).inner_margin(14.0).show(ui, |ui| {
@@ -528,13 +496,6 @@ impl App {
                     {
                         self.start_import_disc(p);
                     }
-                }
-                let label = if enabled_mods > 0 { format!("Mods ({enabled_mods})") } else { "Mods".to_string() };
-                if ui.add(small(label)).on_hover_text(format!("Mods that load for {}", g.title())).clicked() {
-                    self.mods_ui.game_filter = Some(g);
-                    self.mods_ui.search.clear();
-                    self.mods_ui.tab = Tab::Installed;
-                    self.screen = Screen::Mods;
                 }
             });
           });
@@ -913,7 +874,7 @@ impl App {
                     );
                 });
                 section(ui, "About", |ui| {
-                    changed |= self.updater.settings(ui, &mut self.cfg.updates.check_on_start);
+                    ui.label(RichText::new(format!("Digimon Worlds Re:Compiled v{}", env!("CARGO_PKG_VERSION"))).color(MUTED));
                 });
                 if let Some(b) = self.rebinding {
                     let pressed = ctx.input(|i| {
@@ -938,16 +899,6 @@ impl App {
         });
     }
 
-    fn mods_screen(&mut self, ctx: &egui::Context) {
-        self.top_bar(ctx);
-        egui::CentralPanel::default().frame(egui::Frame::default().fill(Color32::from_rgb(13, 14, 18)).inner_margin(24.0)).show(ctx, |ui| {
-            let mut env = crate::mods_page::Env { cfg: &mut self.cfg, paths: &self.paths, lib: &self.lib, running: self.emu.as_ref().map(|e| e.game) };
-            if self.mods_ui.show(ui, &mut env) {
-                self.save_cfg();
-            }
-        });
-    }
-
     fn playing_screen(&mut self, ctx: &egui::Context) {
         let Some(emu) = &self.emu else {
             self.screen = Screen::Library;
@@ -961,21 +912,13 @@ impl App {
             return;
         }
         // Input
-        let overlay_open = self.show_pause || self.show_mods_overlay;
+        let overlay_open = self.show_pause;
         let pad = self.input.poll(ctx, &self.cfg.input.keyboard, !overlay_open);
         let emu = self.emu.as_ref().unwrap();
         emu.set_pad(0, if overlay_open { Default::default() } else { pad });
-        let (esc, f10, f12, tab) =
-            ctx.input(|i| (i.key_pressed(Key::Escape), i.key_pressed(Key::F10), i.key_pressed(Key::F12), i.key_down(Key::Tab)));
+        let (esc, f12, tab) = ctx.input(|i| (i.key_pressed(Key::Escape), i.key_pressed(Key::F12), i.key_down(Key::Tab)));
         if esc {
-            if self.show_mods_overlay {
-                self.show_mods_overlay = false;
-            } else {
-                self.show_pause = !self.show_pause;
-            }
-        }
-        if f10 {
-            self.show_mods_overlay = !self.show_mods_overlay;
+            self.show_pause = !self.show_pause;
         }
         emu.shared.paused.store(overlay_open, Ordering::Relaxed);
         emu.shared.fast_forward.store(tab && !overlay_open, Ordering::Relaxed);
@@ -1185,14 +1128,17 @@ impl App {
                     ui.set_min_width(260.0);
                     ui.label(RichText::new(&status.title).strong());
                     ui.label(RichText::new(format!("Engine: {} · BIOS: {}", status.engine, status.bios)).color(MUTED).small());
+                    if !status.mod_log.is_empty() {
+                        egui::CollapsingHeader::new("Mod log").default_open(false).show(ui, |ui| {
+                            for l in &status.mod_log {
+                                ui.label(RichText::new(l).monospace().small());
+                            }
+                        });
+                    }
                     ui.add_space(6.0);
                     let b = |ui: &mut egui::Ui, t: &str| ui.add(egui::Button::new(t).min_size(Vec2::new(240.0, 30.0))).clicked();
                     if b(ui, "Resume (Esc)") {
                         self.show_pause = false;
-                    }
-                    if b(ui, "Mod manager (F10)") {
-                        self.show_pause = false;
-                        self.show_mods_overlay = true;
                     }
                     if b(ui, "Reset console") {
                         reset = true;
@@ -1225,53 +1171,10 @@ impl App {
                 return;
             }
         }
-        if self.show_mods_overlay {
-            let g = self.emu.as_ref().unwrap().game;
-            let mut open = true;
-            let mut restart = false;
-            egui::Window::new(format!("Mods – {}", g.title()))
-                .open(&mut open)
-                .default_width(560.0)
-                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    if !status.mod_log.is_empty() {
-                        egui::CollapsingHeader::new("Mod log").default_open(false).show(ui, |ui| {
-                            for l in &status.mod_log {
-                                ui.label(RichText::new(l).monospace().small());
-                            }
-                        });
-                    }
-                    let mut changed = false;
-                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                        let mut env = crate::mods_page::Env { cfg: &mut self.cfg, paths: &self.paths, lib: &self.lib, running: Some(g) };
-                        changed = self.mods_ui.game_panel(ui, &mut env, g);
-                    });
-                    if changed {
-                        self.save_cfg();
-                    }
-                    ui.label(RichText::new("Install, update and reorder mods on the Mods page (press Esc, then Quit to game list).").color(MUTED).small());
-                    if self.mods_ui.changed_while_running {
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("Changes apply when the game restarts.").color(WARN));
-                            if ui.button("Restart now").clicked() {
-                                restart = true;
-                            }
-                        });
-                    }
-                });
-            if !open {
-                self.show_mods_overlay = false;
-            }
-            if restart {
-                self.start_game(g);
-            }
-        }
         ctx.request_repaint();
     }
 
-    /// Files dropped on the window: a mod `.zip` is installed, a disc image
-    /// is imported. (Not while playing, so a stray drop never interrupts.)
+    /// Files dropped on the window: a disc image is imported, a BIOS dump added. (Not while playing, so a stray drop never interrupts.)
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         let (hovering, dropped) = ctx.input(|i| (!i.raw.hovered_files.is_empty(), i.raw.dropped_files.clone()));
         self.files_hovering = hovering && self.screen != Screen::Playing;
@@ -1281,7 +1184,7 @@ impl App {
         let mut files: Vec<std::path::PathBuf> = std::mem::take(&mut self.open_files);
         files.extend(dropped.into_iter().filter_map(|f| f.path));
         for path in files {
-            self.open_file(ctx, path);
+            self.open_file(path);
         }
     }
 
@@ -1297,7 +1200,7 @@ impl App {
         }
     }
 
-    fn open_file(&mut self, ctx: &egui::Context, path: std::path::PathBuf) {
+    fn open_file(&mut self, path: std::path::PathBuf) {
         let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
         let bios_sized = std::fs::metadata(&path).map(|m| m.len() == dwrc_runtime::bios::BIOS_SIZE as u64).unwrap_or(false);
         if bios_sized && matches!(ext.as_str(), "bin" | "rom" | "") {
@@ -1306,16 +1209,11 @@ impl App {
             return;
         }
         match ext.as_str() {
-            "zip" => {
-                self.screen = Screen::Mods;
-                let env = crate::mods_page::Env { cfg: &mut self.cfg, paths: &self.paths, lib: &self.lib, running: self.emu.as_ref().map(|e| e.game) };
-                self.mods_ui.import_zip(ctx, &env, path);
-            }
             "cue" | "bin" if self.job.is_none() => {
                 self.screen = Screen::Library;
                 self.start_import_disc(path);
             }
-            _ => self.notify(format!("{} is not a mod (.zip), a disc image (.bin/.cue) or a BIOS dump.", path.display()), true),
+            _ => self.notify(format!("{} is not a disc image (.bin/.cue) or a BIOS dump.", path.display()), true),
         }
     }
 
@@ -1325,7 +1223,7 @@ impl App {
             let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop")));
             p.rect_filled(screen, 0.0, Color32::from_black_alpha(190));
             p.rect_stroke(screen.shrink(18.0), 12.0, Stroke::new(3.0_f32, ACCENT), egui::StrokeKind::Inside);
-            p.text(screen.center(), Align2::CENTER_CENTER, "Drop a mod .zip to install it,\na disc image (.bin/.cue) to import it,\nor a BIOS dump to add it", egui::FontId::proportional(24.0), Color32::WHITE);
+            p.text(screen.center(), Align2::CENTER_CENTER, "Drop a disc image (.bin/.cue) to import it,\nor a BIOS dump to add it", egui::FontId::proportional(24.0), Color32::WHITE);
             ctx.request_repaint();
         }
         if let Some(job) = &self.job {
@@ -1369,16 +1267,6 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_job();
         self.check_net_session();
-        self.updater.poll(ctx);
-        let mut env = crate::mods_page::Env { cfg: &mut self.cfg, paths: &self.paths, lib: &self.lib, running: self.emu.as_ref().map(|e| e.game) };
-        // Mod indexes and mod updates: asked for when the launcher starts.
-        self.mods_ui.tick(ctx, &env);
-        if self.mods_ui.poll(&mut env) {
-            self.save_cfg();
-        }
-        for (msg, err) in std::mem::take(&mut self.mods_ui.toasts) {
-            self.notify(msg, err);
-        }
         self.handle_dropped_files(ctx);
         // F11 toggles fullscreen everywhere (but not while a key is being
         // bound in Settings). The window's real state wins, in case the
@@ -1402,19 +1290,14 @@ impl eframe::App for App {
             Screen::Login => self.login_screen(ctx),
             Screen::Library => self.library_screen(ctx),
             Screen::Settings => self.settings_screen(ctx),
-            Screen::Mods => self.mods_screen(ctx),
             Screen::Playing => self.playing_screen(ctx),
-        }
-        if self.screen != Screen::Playing && self.screen != Screen::Login {
-            if let Some(m) = self.updater.window(ctx) {
-                self.notify(m, true);
-            }
         }
         self.overlays(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_game();
+        self.local_server.stop();
         self.save_cfg();
     }
 }
@@ -1469,15 +1352,6 @@ fn style(ctx: &egui::Context) {
         s.spacing.button_padding = Vec2::new(10.0, 5.0);
         s.spacing.item_spacing = Vec2::new(8.0, 7.0);
     });
-}
-
-pub(crate) fn open_folder(p: &std::path::Path) {
-    #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("explorer").arg(p).spawn();
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(p).spawn();
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let _ = std::process::Command::new("xdg-open").arg(p).spawn();
 }
 
 /// The "sped up" badge shown while a mod runs the game faster: two
@@ -1591,6 +1465,7 @@ impl App {
 
                                 ui.label(RichText::new("Server IP / Host (WS :8080 · UDP :7777)").size(13.0).color(MUTED));
                                 ui.add(egui::TextEdit::singleline(&mut self.login_host).desired_width(f32::INFINITY));
+                                ui.label(RichText::new(self.local_server.status_text()).size(12.0).color(MUTED));
                                 ui.add_space(10.0);
 
                                 ui.label(RichText::new("Username").size(13.0).color(MUTED));

@@ -123,7 +123,7 @@ Re:Compiled ships only a documented **template**; mods themselves come from mod 
 
 * **`dwrc-psx`** models the console: the R3000A (with a reference interpreter that handles branch/load delay slots, exceptions, the instruction cache and multiply/divide/GTE stalls), the GTE, the GPU (software rasteriser following Mednafen's hardware-verified rules), the SPU (24 ADPCM voices, ADSR, reverb), the CD-ROM controller (command timing, XA-ADPCM streaming), MDEC (FMV decoding), DMA, timers, controllers and memory cards.
 * **`dwrc-recomp`** is the static recompiler. When execution reaches a code region, every block statically reachable from it is translated to native code with Cranelift and run against the same hardware model. Overlays loaded later are translated when reached, on a background thread so the game never waits for it (blocks run on the interpreter, with identical results, until their translation is ready), and translations are dropped automatically when the game overwrites their memory. A **validation mode** replays every translated block through the reference interpreter and compares registers, memory traffic and COP0/GTE state.
-* **`dwrc-mods`** implements the mod platform and **`dwrc-modhub`** the mod indexes, mod updates and the program's own updates; **`dwrc-runtime`** the library, import/verification, settings and sessions; **`dwrc`** the launcher/player UI; **`dwrc-cli`** developer tools.
+* **`dwrc-mods`** implements the mod platform; **`dwrc-runtime`** the library, import/verification, settings and sessions; **`dwrc`** the launcher/player UI; **`dwrc-cli`** developer tools.
 
 Details: **[docs/architecture.md](docs/architecture.md)** · accuracy notes: **[docs/accuracy.md](docs/accuracy.md)** · tools: **[docs/dev-tools.md](docs/dev-tools.md)**.
 
@@ -152,7 +152,6 @@ crates/dwrc-mips      R3000A instruction decoding / disassembly
 crates/dwrc-psx       the PlayStation hardware model + reference interpreter
 crates/dwrc-recomp    static recompiler (Cranelift) + validation
 crates/dwrc-mods      mod platform (manifests, .zip install, virtual disc files, patches, Lua)
-crates/dwrc-modhub    mod indexes, GitHub release updates, downloads
 crates/dwrc-runtime   library, import, settings, sessions
 apps/dwrc             the launcher / player (egui)
 apps/dwrc-cli         developer command-line tools

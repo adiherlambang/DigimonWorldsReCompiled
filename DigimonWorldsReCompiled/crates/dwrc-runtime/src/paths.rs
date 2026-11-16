@@ -97,10 +97,6 @@ impl Paths {
         v
     }
 
-    /// Cached mod indexes, GitHub release lists and thumbnails.
-    pub fn modhub_cache_dir(&self) -> PathBuf {
-        self.root.join("cache").join("modhub")
-    }
 
     /// Mod downloads in progress.
     pub fn downloads_dir(&self) -> PathBuf {
