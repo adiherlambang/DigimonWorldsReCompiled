@@ -86,6 +86,10 @@ pub struct App {
     login_pass: String,
     login_error: Option<String>,
     mmo_session: dwrc_net::AccountSession,
+    /// Memegang koneksi WebSocket selama online (sesi berakhir bila ini di-drop).
+    mmo_net: Option<dwrc_net::client::NetClient>,
+    login_register: bool,
+    login_tamer: String,
 }
 
 impl App {
@@ -124,10 +128,13 @@ impl App {
             osd: Vec::new(),
             overlays: Vec::new(),
             login_host: "127.0.0.1".to_string(),
-            login_user: "adi_tamer".to_string(),
-            login_pass: "dev_hash".to_string(),
+            login_user: String::new(),
+            login_pass: String::new(),
             login_error: None,
             mmo_session: dwrc_net::AccountSession::default(),
+            mmo_net: None,
+            login_register: false,
+            login_tamer: String::new(),
             files_hovering: false,
             open_files,
             paths,
@@ -190,6 +197,18 @@ impl App {
         self.show_mods_overlay = false;
         self.mods_ui.changed_while_running = false;
         self.screen = Screen::Playing;
+    }
+
+    /// Server mengakhiri sesi (mis. login dari tempat lain): kembali ke mode lokal.
+    fn check_net_session(&mut self) {
+        let Some(reason) = self.mmo_session.net.as_ref().and_then(|n| n.end_reason()) else { return };
+        self.mmo_session.is_online = false;
+        self.mmo_session.net = None;
+        self.mmo_net = None;
+        if let Some(emu) = &self.emu {
+            *emu.shared.mmo_session.lock().unwrap() = self.mmo_session.clone();
+        }
+        self.notify(format!("Sesi online berakhir: {reason}"), true);
     }
 
     fn stop_game(&mut self) {
@@ -1134,6 +1153,7 @@ impl App {
             if let Some(emu) = &self.emu {
                 let udp_ok = emu.shared.mmo_udp_ok.load(Ordering::Relaxed);
                 let is_online = self.mmo_session.is_online;
+                let others = self.mmo_session.net.as_ref().map(|n| n.snapshot()).unwrap_or_default();
                 if let Ok(guard) = emu.shared.mmo_player.lock() {
                     if let Some((tf, area_name)) = guard.as_ref() {
                         draw_ingame_map_layout(
@@ -1143,6 +1163,7 @@ impl App {
                             area_name,
                             is_online,
                             udp_ok,
+                            &others,
                         );
                     }
                 }
@@ -1347,6 +1368,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_job();
+        self.check_net_session();
         self.updater.poll(ctx);
         let mut env = crate::mods_page::Env { cfg: &mut self.cfg, paths: &self.paths, lib: &self.lib, running: self.emu.as_ref().map(|e| e.game) };
         // Mod indexes and mod updates: asked for when the launcher starts.
@@ -1548,7 +1570,7 @@ impl App {
                 let avail = ui.available_rect_before_wrap();
                 let box_w = 420.0_f32.min(avail.width() - 32.0).max(280.0);
                 let inner_w = box_w - 48.0;
-                let box_h = 380.0;
+                let box_h = if self.login_register { 470.0 } else { 400.0 };
                 let center_rect = egui::Rect::from_center_size(
                     egui::pos2(avail.center().x, avail.top() + (avail.height() / 2.0).max(box_h / 2.0 + 16.0)),
                     egui::vec2(box_w, box_h),
@@ -1563,7 +1585,7 @@ impl App {
                             ui.set_min_width(inner_w);
                             ui.set_max_width(inner_w);
                             ui.vertical(|ui| {
-                                ui.label(RichText::new("Tamer Account Login").size(22.0).strong().color(Color32::WHITE));
+                                ui.label(RichText::new(if self.login_register { "Create Tamer Account" } else { "Tamer Account Login" }).size(22.0).strong().color(Color32::WHITE));
                                 ui.label(RichText::new("SLUS-01032 · File Island Dedicated Server").size(13.0).color(MUTED));
                                 ui.add_space(16.0);
 
@@ -1574,6 +1596,12 @@ impl App {
                                 ui.label(RichText::new("Username").size(13.0).color(MUTED));
                                 ui.add(egui::TextEdit::singleline(&mut self.login_user).desired_width(f32::INFINITY));
                                 ui.add_space(10.0);
+
+                                if self.login_register {
+                                    ui.label(RichText::new("Tamer name (3-16 huruf/angka)").size(13.0).color(MUTED));
+                                    ui.add(egui::TextEdit::singleline(&mut self.login_tamer).desired_width(f32::INFINITY));
+                                    ui.add_space(10.0);
+                                }
 
                                 ui.label(RichText::new("Password").size(13.0).color(MUTED));
                                 let pass_resp = ui.add(
@@ -1590,15 +1618,23 @@ impl App {
 
                                 ui.add_space(18.0);
                                 let login_btn = ui.add(
-                                    egui::Button::new(RichText::new("LOGIN TO SERVER").size(15.5).strong().color(Color32::BLACK))
+                                    egui::Button::new(RichText::new(if self.login_register { "CREATE ACCOUNT" } else { "LOGIN TO SERVER" }).size(15.5).strong().color(Color32::BLACK))
                                         .fill(ACCENT)
                                         .min_size(Vec2::new(inner_w, 38.0)),
                                 );
                                 if login_btn.clicked() || enter_pressed {
-                                    match dwrc_net::authenticate_ws(&self.login_host, &self.login_user, &self.login_pass) {
-                                        Ok(sess) => {
+                                    // Memblokir UI sebentar (hash bcrypt di server); koneksi dipertahankan sesudahnya.
+                                    let res = if self.login_register {
+                                        dwrc_net::client::NetClient::register(&self.login_host, &self.login_user, &self.login_pass, &self.login_tamer)
+                                    } else {
+                                        dwrc_net::client::NetClient::login(&self.login_host, &self.login_user, &self.login_pass)
+                                    };
+                                    match res {
+                                        Ok((sess, client)) => {
                                             self.login_error = None;
+                                            self.login_pass.clear();
                                             self.notify(format!("Login berhasil sebagai Tamer {}!", sess.tamer_name), false);
+                                            self.mmo_net = Some(client); // menggantikan (dan menutup) koneksi lama
                                             self.mmo_session = sess;
                                             self.screen = Screen::Library;
                                         }
@@ -1609,6 +1645,13 @@ impl App {
                                 }
 
                                 ui.add_space(8.0);
+                                let toggle_txt = if self.login_register { "Sudah punya akun? Login" } else { "Belum punya akun? Daftar" };
+                                if ui.add(egui::Button::new(RichText::new(toggle_txt).size(13.0).color(ACCENT)).fill(Color32::TRANSPARENT)).clicked() {
+                                    self.login_register = !self.login_register;
+                                    self.login_error = None;
+                                }
+
+                                ui.add_space(8.0);
                                 let offline_btn = ui.add(
                                     egui::Button::new(RichText::new("Play Offline / Local Mode").size(13.5).color(MUTED))
                                         .fill(Color32::from_rgb(22, 25, 32))
@@ -1616,6 +1659,7 @@ impl App {
                                 );
                                 if offline_btn.clicked() {
                                     self.login_error = None;
+                                    self.mmo_net = None;
                                     let tname = if self.login_user.trim().is_empty() {
                                         "Adi".to_string()
                                     } else {
@@ -1629,6 +1673,7 @@ impl App {
                                         bits: 500,
                                         prosperity: 1,
                                         is_online: false,
+                                        ..Default::default()
                                     };
                                     self.screen = Screen::Library;
                                 }
@@ -1646,6 +1691,7 @@ fn draw_ingame_map_layout(
     area_name: &str,
     is_online: bool,
     udp_ok: bool,
+    others: &[(Option<dwrc_net::state::PeerInfo>, dwrc_net::proto::RemotePlayer)],
 ) {
     let panel_w = 246.0;
     let map_h = 176.0;
@@ -1717,6 +1763,18 @@ fn draw_ingame_map_layout(
         egui::pos2(px, py)
     };
 
+    // Pemain lain di map yang sama (hijau).
+    for (peer, r) in others {
+        let pos = to_canvas(r.x, r.z);
+        let ppos = to_canvas(r.digimon_x, r.digimon_z);
+        p.line_segment([pos, ppos], Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(120, 230, 150, 110)));
+        p.circle_filled(ppos, 3.5, Color32::from_rgb(110, 200, 140));
+        p.circle_filled(pos, 4.5, OK);
+        p.circle_stroke(pos, 5.5, Stroke::new(1.0_f32, Color32::WHITE));
+        let name = peer.as_ref().map(|i| i.name.as_str()).unwrap_or("?");
+        p.text(pos + Vec2::new(6.0, 6.0), Align2::LEFT_CENTER, name, egui::FontId::monospace(10.0), OK);
+    }
+
     let tamer_pos = to_canvas(tf.x, tf.z);
     let partner_pos = to_canvas(tf.digimon_x, tf.digimon_z);
 
@@ -1772,7 +1830,16 @@ fn draw_ingame_map_layout(
         egui::pos2(rect.left() + 10.0, info_top + 32.0),
         Align2::LEFT_TOP,
         format!("Yaw: {} | Anim T/P: {}/{}", tf.yaw, tf.anim_id, tf.digimon_anim),
-        mono,
+        mono.clone(),
         MUTED,
     );
+    if is_online {
+        p.text(
+            egui::pos2(rect.left() + 10.0, info_top + 48.0),
+            Align2::LEFT_TOP,
+            format!("Players here: {}", others.len()),
+            mono,
+            OK,
+        );
+    }
 }

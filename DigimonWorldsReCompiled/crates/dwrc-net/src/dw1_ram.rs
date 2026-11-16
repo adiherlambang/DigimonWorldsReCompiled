@@ -164,21 +164,3 @@ pub fn map_id_to_name(map_id: u16) -> String {
     }
     format!("Unknown Area (0x{:02X})", map_id)
 }
-
-
-pub fn pack_udp_sync(tf: &crate::PlayerTransform) -> [u8; 32] {
-    let mut buf = [0u8; 32];
-    buf[0] = 0x01;
-    buf[1] = (tf.map_id & 0xFF) as u8;
-    buf[2..4].copy_from_slice(&tf.digimon_id.to_le_bytes());
-    buf[4..8].copy_from_slice(&tf.x.to_le_bytes());
-    buf[8..12].copy_from_slice(&tf.y.to_le_bytes());
-    buf[12..16].copy_from_slice(&tf.z.to_le_bytes());
-    buf[16..18].copy_from_slice(&tf.yaw.to_le_bytes());
-    buf[18] = tf.anim_id;
-    buf[19] = tf.digimon_anim;
-    buf[20..24].copy_from_slice(&tf.digimon_x.to_le_bytes());
-    buf[24..28].copy_from_slice(&tf.digimon_z.to_le_bytes());
-    buf[28..32].copy_from_slice(&tf.player_id.to_le_bytes());
-    buf
-}

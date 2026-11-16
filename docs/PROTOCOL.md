@@ -51,3 +51,16 @@ Pemain yang tidak mengirim UDP selama 10 detik dikeluarkan dari map-nya (sesi WS
 - `sessionKey` dan password lewat WebSocket **tanpa enkripsi**. Untuk server publik, pasang reverse proxy TLS (nginx/Caddy) di depan `:8080` dan pakai `wss://`.
 - UDP diautentikasi (MAC) tetapi tidak dienkripsi: posisi pemain terlihat oleh penyadap, namun tidak bisa dipalsukan.
 - Bits / Prosperity / Mentor Points hanya diubah server; klien belum punya jalur untuk menulisnya.
+
+## 4. Implementasi klien (Rust, crate `dwrc-net`)
+
+- `client::NetClient::{login, register}` — membuka WebSocket (`tungstenite`) dan **mempertahankannya** di thread `mmo-ws`.
+  Server mengakhiri sesi begitu koneksi putus, jadi `NetClient` harus tetap hidup selama online (disimpan di `App.mmo_net`).
+  Meng-drop `NetClient` = logout.
+- `state::NetShared` — state bersama (peers dari event WS, posisi pemain lain dari UDP, alasan sesi berakhir).
+- `proto` — `pack_sync` (paket 44 byte + MAC), `parse_relay`, `SeqGen`, `drain_relays`.
+- Thread emulasi (`apps/dwrc/src/emu.rs`) membaca RAM tiap 3 frame, mengirim UDP v2, dan menguras relay masuk.
+- Minimap HUD menggambar pemain lain (hijau). Pemain lain **belum dirender di dalam game** (tahap berikutnya).
+
+Tes: `cargo test -p dwrc-net` (unit, termasuk vektor paket yang dicocokkan byte-per-byte dengan `game-server/src/protocol.js`) dan
+`cargo test -p dwrc-net --test live -- --ignored` (end-to-end melawan server yang sedang berjalan).

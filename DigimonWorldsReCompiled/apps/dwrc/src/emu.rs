@@ -3,7 +3,7 @@
 
 use crate::audio::AudioShared;
 use dwrc_disc::GameId;
-use dwrc_net::{dw1_ram, AccountSession, MapTransitionFilter, PlayerTransform};
+use dwrc_net::{dw1_ram, proto, AccountSession, MapTransitionFilter, PlayerTransform};
 use std::net::UdpSocket;
 use dwrc_mods::overlay::Overlay;
 use dwrc_mods::EnabledMod;
@@ -166,6 +166,9 @@ fn run(
     let mut map_filter = MapTransitionFilter::new(8);
     let udp_sock = UdpSocket::bind("0.0.0.0:0").ok();
     if let Some(ref s) = udp_sock { let _ = s.set_nonblocking(true); }
+    let mut seq_gen = proto::SeqGen::new();
+    // Alamat UDP server di-resolve sekali per (host, port), bukan per paket.
+    let mut udp_target: Option<(String, u16, std::net::SocketAddr)> = None;
     while !sh.quit.load(Ordering::Relaxed) {
         while let Ok(c) = rx.try_recv() {
             match c {
@@ -202,15 +205,25 @@ fn run(
         frame_n += 1;
         if session.ident.serial == "SLUS-01032" && frame_n % 3 == 0 {
             let sess = sh.mmo_session.lock().unwrap().clone();
+            if sess.is_online {
+                let same = udp_target.as_ref().map(|(h, p, _)| (h.as_str(), *p)) == Some((sess.server_host.as_str(), sess.udp_port));
+                if !same {
+                    udp_target = proto::resolve_udp(&sess.server_host, sess.udp_port).map(|a| (sess.server_host.clone(), sess.udp_port, a));
+                }
+                // Terima posisi pemain lain (tidak perlu menunggu map stabil).
+                if let (Some(sock), Some((_, _, addr)), Some(net)) = (&udp_sock, &udp_target, &sess.net) {
+                    proto::drain_relays(sock, addr.ip(), net);
+                    net.expire(Duration::from_secs(3));
+                }
+            }
             let mut tf = dw1_ram::extract_player_transform(&session.psx.bus.ram, sess.tamer_id, &sess.tamer_name);
             if let Some(stable_map) = map_filter.update(&tf) {
                 tf.map_id = stable_map;
                 let area = dw1_ram::map_id_to_name(stable_map);
                 if sess.is_online {
-                    if let Some(ref sock) = udp_sock {
-                        let pkt = dw1_ram::pack_udp_sync(&tf);
-                        let target = format!("{}:7777", sess.server_host);
-                        let sent = sock.send_to(&pkt, &target).is_ok();
+                    if let (Some(sock), Some((_, _, addr))) = (&udp_sock, &udp_target) {
+                        let pkt = proto::pack_sync(&tf, sess.session_id, &sess.session_key, seq_gen.next());
+                        let sent = sock.send_to(&pkt, *addr).is_ok();
                         sh.mmo_udp_ok.store(sent, Ordering::Relaxed);
                     }
                 }
