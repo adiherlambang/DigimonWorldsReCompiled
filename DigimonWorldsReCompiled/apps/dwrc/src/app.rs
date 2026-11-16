@@ -51,7 +51,6 @@ pub struct App {
     cfg: Config,
     screen: Screen,
     emu: Option<EmuHandle>,
-    local_server: crate::local_server::LocalServer,
     audio: Arc<AudioShared>,
     _audio_out: Option<AudioOut>,
     audio_error: Option<String>,
@@ -134,7 +133,6 @@ impl App {
             cfg,
             screen: Screen::Login,
             emu: None,
-            local_server: crate::local_server::LocalServer::start(),
             audio,
             _audio_out: audio_out,
             audio_error,
@@ -1297,7 +1295,6 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_game();
-        self.local_server.stop();
         self.save_cfg();
     }
 }
@@ -1465,7 +1462,6 @@ impl App {
 
                                 ui.label(RichText::new("Server IP / Host (WS :8080 · UDP :7777)").size(13.0).color(MUTED));
                                 ui.add(egui::TextEdit::singleline(&mut self.login_host).desired_width(f32::INFINITY));
-                                ui.label(RichText::new(self.local_server.status_text()).size(12.0).color(MUTED));
                                 ui.add_space(10.0);
 
                                 ui.label(RichText::new("Username").size(13.0).color(MUTED));

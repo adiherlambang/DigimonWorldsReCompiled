@@ -9,7 +9,6 @@ mod audio;
 mod crt;
 mod emu;
 mod input;
-mod local_server;
 
 use eframe::egui;
 
