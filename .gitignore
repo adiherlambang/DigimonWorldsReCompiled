@@ -1,0 +1,15 @@
+﻿# Rust (DigimonWorldsReCompiled target & cache)
+/upstream/DigimonWorldsReCompiled/target/
+**/.cargo-lock
+**/.rustc_info.json
+
+# Node.js (game-server modules)
+/game-server/node_modules/
+npm-debug.log*
+yarn-debug.log*
+
+# Database temporary / logs
+*.sqlite-journal
+*.log
+.DS_Store
+Thumbs.db

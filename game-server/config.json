@@ -1,0 +1,14 @@
+{
+  "udpPort": 7777,
+  "wsPort": 8080,
+  "sql": {
+    "user": "sa",
+    "password": "YourSqlPasswordHere",
+    "server": "localhost",
+    "database": "DW1_MMO",
+    "options": {
+      "encrypt": false,
+      "trustServerCertificate": true
+    }
+  }
+}
