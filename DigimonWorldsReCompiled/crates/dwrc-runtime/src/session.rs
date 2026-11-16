@@ -1,0 +1,329 @@
+//! A play session: one game running on the PS1 core with its BIOS, disc,
+//! memory cards, mods and execution engine.
+
+use crate::config::{Config, EngineKind, Widescreen};
+use crate::library::{BiosChoice, DiscStatus, Library};
+use crate::paths::Paths;
+use crate::savestate::StateStore;
+use anyhow::{anyhow, bail, Context, Result};
+use dwrc_disc::ident::Region;
+use dwrc_disc::iso9660::IsoFs;
+use dwrc_disc::{GameId, Identification, PsxExe, SectorSource};
+use dwrc_mods::{EnabledMod, ModRuntime};
+use dwrc_psx::cdrom::DiscRegion;
+use dwrc_psx::memcard::{MemoryCard, CARD_SIZE};
+use dwrc_psx::{PadState, Psx, VideoStandard, CPU_CLOCK};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+pub struct Session {
+    pub game: GameId,
+    pub ident: Identification,
+    pub psx: Psx,
+    pub mods: ModRuntime,
+    pub enabled_mods: Vec<String>,
+    card_paths: [Option<PathBuf>; 2],
+    last_flush: Instant,
+    last_frame_cycles: u64,
+    /// Emulated duration of the last frame.
+    pub last_frame_time: Duration,
+    pub frame: u64,
+    pub engine: EngineKind,
+    /// The BIOS this session runs (a console dump or the built-in one).
+    pub bios_name: String,
+    /// A PAL release running in its own 60 Hz mode (see `pal60`).
+    pub sixty_hz: bool,
+    /// The widescreen shape in use (Off for a game without widescreen).
+    widescreen: Widescreen,
+    /// Widescreen UI switched on (it acts only with widescreen on).
+    widescreen_ui: bool,
+    /// This release's save states (used by mods through `dwrc.save_state`).
+    states: StateStore,
+    /// Messages for the screen (from mods and save states).
+    notices: Vec<String>,
+    /// Images the mods show over the picture, when they changed.
+    overlays: Option<Vec<dwrc_mods::overlay::Overlay>>,
+    /// Mouse support (`None`: switched off, or no rules for this game).
+    mouse: Option<crate::mouse::Mouse>,
+}
+
+/// Information shown before starting (so the UI can explain problems).
+pub fn preflight(lib: &Library, game: GameId) -> Result<()> {
+    match lib.status(game) {
+        DiscStatus::NotImported => bail!("{} has not been imported yet.", game.title()),
+        DiscStatus::Missing => bail!("The disc image for {} was moved or deleted. Import it again.", game.title()),
+        DiscStatus::Changed => bail!("The disc image for {} changed since it was verified. Import it again.", game.title()),
+        DiscStatus::Ready => {}
+    }
+    Ok(())
+}
+
+fn load_card(path: &PathBuf) -> MemoryCard {
+    match std::fs::read(path) {
+        Ok(d) if d.len() == CARD_SIZE => MemoryCard::from_bytes(d.into_boxed_slice()),
+        Ok(d) => {
+            log::warn!("{} is {} bytes, expected {CARD_SIZE}; using a new card", path.display(), d.len());
+            MemoryCard::new_formatted()
+        }
+        Err(_) => MemoryCard::new_formatted(),
+    }
+}
+
+impl Session {
+    pub fn start(paths: &Paths, lib: &Library, cfg: &Config, game: GameId, mods: Vec<EnabledMod>) -> Result<Self> {
+        preflight(lib, game)?;
+        let entry = &lib.games[&game];
+        let ident = entry.ident.clone();
+        let choice = lib.bios_choice(ident.region, cfg.emulation.bios);
+        let bios_name = choice.label();
+        let (bios, console_bios) = match choice {
+            BiosChoice::Console(b) => (std::fs::read(&b.path).with_context(|| format!("reading {}", b.path.display()))?, true),
+            BiosChoice::BuiltIn => (crate::bios::BUILTIN_BIOS.to_vec(), false),
+        };
+
+        let mut disc = crate::library::open_disc(entry)?;
+
+        // Mods: disc overrides first (they edit the virtual disc).
+        let enabled_mods: Vec<String> = mods.iter().map(|m| m.info.id().to_string()).collect();
+        // The other games' discs, for mods that draw on them (`uses_games`).
+        let mut others = dwrc_mods::others::OtherDiscs::default();
+        for (g, e) in lib.games.iter().filter(|(g, _)| **g != game) {
+            let entry = e.clone();
+            others.add(*g, &e.ident.serial, &e.ident.title, move || crate::library::open_disc(&entry));
+        }
+        let mut mod_rt = {
+            let mut ctx = dwrc_mods::disc::DiscContext::new(&mut disc);
+            ModRuntime::build_with_others(game, &ident.serial, &mods, &mut ctx, &mut others)
+        };
+        drop(others);
+        for l in &mod_rt.log {
+            log::info!("{l}");
+        }
+        // Read the boot executable from the (possibly modded) disc.
+        let fs = IsoFs::mount(&mut disc)?;
+        let exe_entry = fs.find(&mut disc, &ident.boot_file)?.ok_or_else(|| anyhow!("boot executable missing"))?;
+        let exe = PsxExe::parse(&fs.read(&mut disc, &exe_entry)?)?;
+
+        let (standard, region) = match ident.region {
+            Region::Pal => (VideoStandard::Pal, DiscRegion::Pal),
+            Region::NtscJ => (VideoStandard::Ntsc, DiscRegion::NtscJ),
+            Region::NtscU => (VideoStandard::Ntsc, DiscRegion::NtscU),
+        };
+        let states = StateStore::new(paths.states_dir(&ident.serial), &ident.serial, &ident.title, &bios, &bios_name);
+        let mut psx = Psx::new(&bios, standard);
+        psx.insert_disc(Box::new(disc) as Box<dyn SectorSource>, region);
+        let sixty_hz = cfg.video.pal_60hz && crate::pal60::enable(&mut psx, &ident.serial, &exe);
+
+        let saves = paths.saves_dir(game);
+        std::fs::create_dir_all(&saves)?;
+        let c1 = saves.join("card1.mcd");
+        let c2 = saves.join("card2.mcd");
+        psx.bus.sio.cards[0] = Some(load_card(&c1));
+        psx.bus.sio.cards[1] = if cfg.emulation.memory_card_2 { Some(load_card(&c2)) } else { None };
+        let card_paths = [Some(c1), if cfg.emulation.memory_card_2 { Some(c2) } else { None }];
+
+        // Fast boot skips the Sony BIOS's logo; the built-in BIOS boots the
+        // disc directly anyway.
+        if cfg.emulation.fast_boot && console_bios {
+            psx.enable_fast_boot(exe.clone());
+        }
+        let engine = cfg.emulation.engine;
+        match engine {
+            EngineKind::Interpreter => {}
+            EngineKind::Recompiled => psx.set_engine(dwrc_recomp::new_engine(dwrc_recomp::Mode::Native)),
+            EngineKind::Validate => psx.set_engine(dwrc_recomp::new_engine(dwrc_recomp::Mode::Validate)),
+        }
+        mod_rt.install(&mut psx);
+        let widescreen = if crate::widescreen::supported(game) { cfg.video.widescreen } else { Widescreen::Off };
+        crate::widescreen::install_hooks(&mut psx, game, &exe);
+        crate::widescreen::apply(&mut psx, game, widescreen, cfg.video.widescreen_ui);
+        let mouse = if cfg.input.mouse { crate::mouse::Mouse::new(&mut psx, &ident) } else { None };
+        log::info!(
+            "starting {} ({}) with the {} engine and the {bios_name} BIOS{}{}",
+            ident.title,
+            ident.serial,
+            psx.engine_name(),
+            if sixty_hz { ", in its 60 Hz mode" } else { "" },
+            if widescreen != Widescreen::Off { format!(", widescreen {}", widescreen.label()) } else { String::new() }
+        );
+        Ok(Self {
+            game,
+            ident,
+            psx,
+            mods: mod_rt,
+            enabled_mods,
+            card_paths,
+            last_flush: Instant::now(),
+            last_frame_cycles: 0,
+            last_frame_time: Duration::from_millis(16),
+            frame: 0,
+            engine,
+            bios_name,
+            sixty_hz,
+            widescreen,
+            widescreen_ui: cfg.video.widescreen_ui,
+            states,
+            notices: Vec::new(),
+            overlays: None,
+            mouse,
+        })
+    }
+
+    pub fn set_pad(&mut self, port: usize, mut state: PadState) {
+        if port == 0 {
+            // The mouse's presses join the keyboard's and the gamepad's.
+            if let Some(m) = &mut self.mouse {
+                state.buttons |= m.buttons();
+            }
+            state.buttons = self.mods.filter_input(state.buttons);
+        }
+        self.psx.bus.sio.pads[port].state = state;
+        self.psx.bus.sio.pads[port].connected = port == 0 || state.buttons != 0 || self.psx.bus.sio.pads[port].connected;
+    }
+
+    pub fn run_frame(&mut self) {
+        // Mods may ask for the console to run faster (and for some sound
+        // chip voices to keep real time meanwhile).
+        self.mods.apply_speed(&mut self.psx);
+        self.psx.run_frame();
+        self.frame += 1;
+        self.mods.on_frame(&mut self.psx, self.frame);
+        self.after_mods();
+        if let Some(m) = &mut self.mouse {
+            m.after_frame(&mut self.psx);
+        }
+        let c = self.psx.bus.cycles;
+        let dc = c - self.last_frame_cycles;
+        self.last_frame_cycles = c;
+        self.last_frame_time = Duration::from_nanos(dc * 1_000_000_000 / CPU_CLOCK);
+        if self.last_flush.elapsed() > Duration::from_secs(2) {
+            self.flush_memcards();
+        }
+    }
+
+    /// A key pressed on the keyboard while the game runs (for mods).
+    pub fn key(&mut self, key: &str, shift: bool, ctrl: bool, alt: bool) {
+        self.mods.on_key(&mut self.psx, key, shift, ctrl, alt);
+        self.after_mods();
+    }
+
+    /// Carries out what the mods asked for (save states) and collects their
+    /// messages.
+    fn after_mods(&mut self) {
+        let mut loaded = false;
+        let n = crate::savestate::handle_requests(&self.states, &mut self.psx, &mut self.mods, &mut loaded);
+        self.notices.extend(n);
+        self.notices.extend(self.mods.take_notices());
+        if let Some(o) = self.mods.take_overlays() {
+            self.overlays = Some(o);
+        }
+        if loaded {
+            // The console's clock went back (or forward) with the state.
+            self.last_frame_cycles = self.psx.bus.cycles;
+            if let Some(m) = &mut self.mouse {
+                m.reset();
+            }
+        }
+    }
+
+    /// Switches mouse support on or off.
+    pub fn set_mouse(&mut self, on: bool) {
+        match (on, self.mouse.take()) {
+            (true, None) => self.mouse = crate::mouse::Mouse::new(&mut self.psx, &self.ident),
+            (true, m) => self.mouse = m,
+            (false, Some(m)) => m.remove(&mut self.psx),
+            (false, None) => {}
+        }
+    }
+
+    /// A click on the picture: `u`, `v` from 0 to 1 across the console's
+    /// own 4:3 picture (outside it beside it, with widescreen).
+    pub fn click(&mut self, right: bool, u: f32, v: f32) {
+        let Some(m) = &mut self.mouse else { return };
+        let d = self.psx.bus.gpu.latched;
+        let (w, h) = (d.width.max(1) as i32, d.height.max(1) as i32);
+        m.click(crate::mouse::Click { right, x: (u * w as f32).floor() as i32, y: (v * h as f32).floor() as i32, width: w, height: h });
+    }
+
+    /// Messages for the screen since the last call.
+    pub fn take_notices(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notices)
+    }
+
+    /// The images the mods show over the picture (`dwrc.show_image`), if
+    /// they changed since the last call.
+    pub fn take_overlays(&mut self) -> Option<Vec<dwrc_mods::overlay::Overlay>> {
+        self.overlays.take()
+    }
+
+    /// How many times faster than real time the console runs (set by mods).
+    pub fn speed(&self) -> u32 {
+        self.psx.bus.spu.speed.max(1)
+    }
+
+    /// Renders the current display into ARGB pixels.
+    pub fn frame_pixels(&self, out: &mut Vec<u32>) -> (u32, u32) {
+        self.psx.bus.gpu.render_display(out)
+    }
+
+    pub fn take_audio(&mut self, out: &mut Vec<i16>) {
+        self.psx.bus.spu.take_output(out);
+    }
+
+    /// Changes the widescreen shape (ignored by a game without widescreen)
+    /// and Widescreen UI.
+    pub fn set_widescreen(&mut self, w: Widescreen, ui: bool) {
+        self.widescreen = if crate::widescreen::supported(self.game) { w } else { Widescreen::Off };
+        self.widescreen_ui = ui;
+        crate::widescreen::apply(&mut self.psx, self.game, self.widescreen, ui);
+    }
+
+    /// How much wider than 4:3 the picture is to be shown (1.0: 4:3).
+    pub fn picture_stretch(&self) -> f32 {
+        self.widescreen.stretch()
+    }
+
+    /// Whether Widescreen UI is moving the game's UI (widescreen on too).
+    pub fn ui_moved(&self) -> bool {
+        self.widescreen_ui && self.widescreen != Widescreen::Off
+    }
+
+    pub fn is_pal(&self) -> bool {
+        self.psx.bus.gpu.is_pal_mode()
+    }
+
+    /// Writes changed memory cards to disk.
+    pub fn flush_memcards(&mut self) {
+        self.last_flush = Instant::now();
+        for (i, p) in self.card_paths.iter().enumerate() {
+            let (Some(p), Some(card)) = (p, self.psx.bus.sio.cards[i].as_mut()) else { continue };
+            if card.dirty {
+                let tmp = p.with_extension("mcd.tmp");
+                if std::fs::write(&tmp, &card.data).and_then(|_| std::fs::rename(&tmp, p)).is_ok() {
+                    card.dirty = false;
+                } else {
+                    log::error!("could not save memory card {}", p.display());
+                }
+            }
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.flush_memcards();
+        self.psx.reset();
+        if let Some(m) = &mut self.mouse {
+            m.reset();
+        }
+    }
+
+    pub fn shutdown(&mut self) {
+        self.flush_memcards();
+        self.mods.save_all();
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}

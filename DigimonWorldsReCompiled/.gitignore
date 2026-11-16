@@ -1,0 +1,18 @@
+/target
+Original_Dumps/
+Original_Dumps_Backup/
+_dev_staging/
+*.bin
+*.BIN
+*.cue
+*.iso
+*.mcd
+portable.txt
+/data/
+
+# The mod index is its own repository (Jack-The-Gamer/DigimonWorldsReCompiled-mod-index);
+# ignored in case a copy is ever kept inside this folder.
+/mod-index/
+
+# The built-in open-source BIOS (MIT) is part of the program.
+!assets/openbios/openbios.bin

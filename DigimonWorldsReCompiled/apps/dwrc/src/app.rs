@@ -1,0 +1,1778 @@
+//! The launcher / player user interface.
+
+use crate::audio::{self, AudioOut, AudioShared};
+use crate::emu::{EmuCmd, EmuHandle};
+use crate::input::{self, Input};
+use dwrc_disc::GameId;
+use crate::mods_page::{ModsUi, Tab};
+use dwrc_psx::Button;
+use dwrc_runtime::bios::region_label;
+use dwrc_runtime::config::{Aspect, BiosMode, EngineKind, Filter, Widescreen};
+use dwrc_runtime::library::GameEntry;
+use dwrc_runtime::{Config, DiscStatus, Library, Paths};
+use eframe::egui::{self, Align, Align2, Color32, Key, Layout, RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2};
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+pub(crate) const ACCENT: Color32 = Color32::from_rgb(255, 140, 26);
+pub(crate) const ACCENT_DIM: Color32 = Color32::from_rgb(120, 70, 20);
+pub(crate) const BLUE: Color32 = Color32::from_rgb(64, 156, 255);
+pub(crate) const CARD_BG: Color32 = Color32::from_rgb(28, 31, 38);
+pub(crate) const PANEL_BG: Color32 = Color32::from_rgb(18, 20, 25);
+pub(crate) const OK: Color32 = Color32::from_rgb(90, 200, 120);
+pub(crate) const WARN: Color32 = Color32::from_rgb(240, 190, 70);
+pub(crate) const BAD: Color32 = Color32::from_rgb(235, 90, 90);
+pub(crate) const MUTED: Color32 = Color32::from_rgb(150, 156, 168);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Login,
+    Library,
+    Mods,
+    Settings,
+    Playing,
+}
+
+enum JobResult {
+    Library(Library, String),
+    Failed(String),
+}
+
+struct Job {
+    label: String,
+    progress: Arc<Mutex<(String, f32)>>,
+    rx: Receiver<JobResult>,
+}
+
+pub struct App {
+    paths: Paths,
+    lib: Library,
+    cfg: Config,
+    screen: Screen,
+    emu: Option<EmuHandle>,
+    audio: Arc<AudioShared>,
+    _audio_out: Option<AudioOut>,
+    audio_error: Option<String>,
+    input: Input,
+    game_tex: Option<TextureHandle>,
+    game_size: (u32, u32),
+    last_seq: u64,
+    thumbs: HashMap<GameId, Option<TextureHandle>>,
+    job: Option<Job>,
+    toast: Option<(String, Instant, bool)>,
+    show_pause: bool,
+    show_mods_overlay: bool,
+    rebinding: Option<Button>,
+    fullscreen: bool,
+    mods_ui: ModsUi,
+    autostart: Option<GameId>,
+    files_hovering: bool,
+    open_files: Vec<std::path::PathBuf>,
+    updater: crate::footer::Updater,
+    /// The CRT filter (None when OpenGL 3 shaders are unavailable).
+    crt: Option<Arc<crate::crt::Crt>>,
+    crt_error: Option<String>,
+    /// Height of the Games page content last frame (to centre it).
+    library_h: f32,
+    /// Short messages over the game picture (mods, save states), newest last.
+    osd: Vec<(String, Instant)>,
+    /// Images mods show over the picture (`dwrc.show_image`).
+    overlays: Vec<(dwrc_mods::overlay::Overlay, TextureHandle)>,
+    login_host: String,
+    login_user: String,
+    login_pass: String,
+    login_error: Option<String>,
+    mmo_session: dwrc_net::AccountSession,
+}
+
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>, autostart: Option<GameId>, open_files: Vec<std::path::PathBuf>) -> Self {
+        let paths = Paths::detect();
+        let _ = paths.ensure();
+        let lib = Library::load(&paths);
+        let cfg = Config::load(&paths);
+        style(&cc.egui_ctx);
+        let audio = AudioShared::new();
+        audio.set_volume(if cfg.audio.muted { 0.0 } else { cfg.audio.volume });
+        let (audio_out, audio_error) = match audio::start(audio.clone()) {
+            Ok(a) => (Some(a), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
+        let fullscreen = cfg.video.start_fullscreen;
+        if fullscreen {
+            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        }
+        let mods_ui = ModsUi::new(&paths);
+        let updater = crate::footer::Updater::new(&paths, cfg.updates.check_on_start);
+        let (crt, crt_error) = match cc.gl.as_ref().map(|gl| crate::crt::Crt::new(gl)) {
+            Some(Ok(c)) => (Some(Arc::new(c)), None),
+            Some(Err(e)) => {
+                log::warn!("CRT filter unavailable: {e}");
+                (None, Some(e))
+            }
+            None => (None, Some("needs the OpenGL renderer".to_string())),
+        };
+        Self {
+            mods_ui,
+            updater,
+            crt,
+            crt_error,
+            library_h: 0.0,
+            osd: Vec::new(),
+            overlays: Vec::new(),
+            login_host: "127.0.0.1".to_string(),
+            login_user: "adi_tamer".to_string(),
+            login_pass: "dev_hash".to_string(),
+            login_error: None,
+            mmo_session: dwrc_net::AccountSession::default(),
+            files_hovering: false,
+            open_files,
+            paths,
+            lib,
+            cfg,
+            screen: Screen::Login,
+            emu: None,
+            audio,
+            _audio_out: audio_out,
+            audio_error,
+            input: Input::new(),
+            game_tex: None,
+            game_size: (0, 0),
+            last_seq: 0,
+            thumbs: HashMap::new(),
+            job: None,
+            toast: None,
+            show_pause: false,
+            show_mods_overlay: false,
+            rebinding: None,
+            fullscreen,
+            autostart,
+        }
+    }
+
+    fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        self.fullscreen = !self.fullscreen;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+    }
+
+    fn notify(&mut self, msg: impl Into<String>, error: bool) {
+        self.toast = Some((msg.into(), Instant::now(), error));
+    }
+
+    fn save_cfg(&mut self) {
+        if let Err(e) = self.cfg.save(&self.paths) {
+            self.notify(format!("Could not save settings: {e}"), true);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Game lifecycle
+    // ------------------------------------------------------------------
+
+    fn start_game(&mut self, g: GameId) {
+        if let Err(e) = dwrc_runtime::session::preflight(&self.lib, g) {
+            self.notify(e.to_string(), true);
+            return;
+        }
+        self.stop_game();
+        let serial = self.lib.games[&g].ident.serial.clone();
+        let mods = dwrc_runtime::enabled_mods(&self.paths, &self.cfg, g, &serial);
+        let emu = EmuHandle::start(self.paths.clone(), self.lib.clone(), self.cfg.clone(), g, mods, self.audio.clone());
+        *emu.shared.mmo_session.lock().unwrap() = self.mmo_session.clone();
+        self.emu = Some(emu);
+        self.game_tex = None;
+        self.overlays.clear();
+        self.last_seq = 0;
+        self.show_pause = false;
+        self.show_mods_overlay = false;
+        self.mods_ui.changed_while_running = false;
+        self.screen = Screen::Playing;
+    }
+
+    fn stop_game(&mut self) {
+        if let Some(mut emu) = self.emu.take() {
+            // Keep the last frame as the library thumbnail.
+            let g = emu.game;
+            let stretch = emu.shared.status.lock().unwrap().stretch;
+            {
+                let f = emu.shared.frame.lock().unwrap();
+                if f.width > 0 {
+                    let dir = self.paths.cache_dir(g);
+                    let _ = std::fs::create_dir_all(&dir);
+                    // The card shows 4:3: a widescreen picture's middle.
+                    let keep = (f.width as f32 / stretch.max(1.0)).round() as u32;
+                    let px = dwrc_runtime::widescreen::crop_middle(&f.pixels, f.width, f.height, keep);
+                    let _ = save_png(&dir.join("thumbnail.png"), keep.min(f.width), f.height, &px);
+                }
+            }
+            emu.stop();
+            self.thumbs.remove(&g);
+        }
+        self.audio.clear();
+    }
+
+    fn thumbnail(&mut self, ctx: &egui::Context, g: GameId) -> Option<TextureHandle> {
+        if !self.thumbs.contains_key(&g) {
+            let p = self.paths.cache_dir(g).join("thumbnail.png");
+            let tex = load_png(&p).map(|(w, h, rgba)| {
+                ctx.load_texture(
+                    format!("thumb-{}", g.slug()),
+                    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba),
+                    TextureOptions::LINEAR,
+                )
+            });
+            self.thumbs.insert(g, tex);
+        }
+        self.thumbs.get(&g).cloned().flatten()
+    }
+
+    // ------------------------------------------------------------------
+    // Background jobs (import / scan)
+    // ------------------------------------------------------------------
+
+    fn start_import_disc(&mut self, path: std::path::PathBuf) {
+        let mut lib = self.lib.clone();
+        let progress = Arc::new(Mutex::new((String::from("Verifying disc"), 0.0f32)));
+        let (tx, rx) = channel();
+        let p2 = progress.clone();
+        std::thread::spawn(move || {
+            let r = lib.import_disc(&path, &mut |f| p2.lock().unwrap().1 = f);
+            let _ = tx.send(match r {
+                Ok(g) => {
+                    let e = &lib.games[&g];
+                    let msg = if e.verified {
+                        format!("{} imported and verified.", e.ident.title)
+                    } else {
+                        format!("{} imported. This dump is not one Re:Compiled has verified, but it identifies as the right game.", e.ident.title)
+                    };
+                    JobResult::Library(lib, msg)
+                }
+                Err(e) => JobResult::Failed(format!("{e:#}")),
+            });
+        });
+        self.job = Some(Job { label: "Importing disc".into(), progress, rx });
+    }
+
+    fn start_scan(&mut self, dir: std::path::PathBuf) {
+        let mut lib = self.lib.clone();
+        let progress = Arc::new(Mutex::new((String::from("Scanning"), 0.0f32)));
+        let (tx, rx) = channel();
+        let p2 = progress.clone();
+        std::thread::spawn(move || {
+            let report = lib.scan_folder(&dir, &mut |name, f| *p2.lock().unwrap() = (format!("Verifying {name}"), f));
+            let mut msg = String::new();
+            for (_, t, v) in &report.games {
+                msg.push_str(&format!("{} {}\n", if *v { "✔" } else { "•" }, t));
+            }
+            for b in &report.bios {
+                msg.push_str(&format!("✔ BIOS {b}\n"));
+            }
+            if msg.is_empty() {
+                msg = "No supported discs or BIOS images were found in that folder.".into();
+            }
+            let _ = tx.send(JobResult::Library(lib, msg.trim_end().to_string()));
+        });
+        self.job = Some(Job { label: "Scanning folder".into(), progress, rx });
+    }
+
+    fn poll_job(&mut self) {
+        let Some(job) = &self.job else { return };
+        if let Ok(r) = job.rx.try_recv() {
+            self.job = None;
+            match r {
+                JobResult::Library(lib, msg) => {
+                    self.lib = lib;
+                    if let Err(e) = self.lib.save(&self.paths) {
+                        self.notify(format!("Could not save library: {e}"), true);
+                    } else {
+                        self.notify(msg, false);
+                    }
+                }
+                JobResult::Failed(e) => self.notify(e, true),
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Screens
+    // ------------------------------------------------------------------
+
+    fn top_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("top")
+            .frame(egui::Frame::default().fill(PANEL_BG).inner_margin(egui::Margin::symmetric(18, 12)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("DIGIMON WORLD 1").size(22.0).strong().color(Color32::WHITE));
+                    ui.label(RichText::new("MMO Online").size(22.0).strong().color(ACCENT));
+                    ui.add_space(16.0);
+                    let status_col = if self.mmo_session.is_online { OK } else { WARN };
+                    let mode_lbl = if self.mmo_session.is_online { "ONLINE" } else { "LOCAL MODE" };
+                    ui.label(
+                        RichText::new(format!(
+                            "Tamer: {} (#{})  ·  Bits: {}  ·  Prosperity: {}  ·  [{}]",
+                            self.mmo_session.tamer_name,
+                            self.mmo_session.tamer_id,
+                            self.mmo_session.bits,
+                            self.mmo_session.prosperity,
+                            mode_lbl
+                        ))
+                        .size(13.5)
+                        .color(status_col),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let close = egui::Button::new(RichText::new("Close").size(16.0).strong().color(MUTED))
+                            .fill(Color32::TRANSPARENT)
+                            .min_size(Vec2::new(96.0, 30.0));
+                        if ui.add(close).on_hover_text("Quit Digimon Worlds Re:Compiled").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        let logout = egui::Button::new(RichText::new("Logout").size(15.0).strong().color(WARN))
+                            .fill(Color32::TRANSPARENT)
+                            .min_size(Vec2::new(82.0, 30.0));
+                        if ui.add(logout).on_hover_text("Kembali ke halaman Login").clicked() {
+                            self.stop_game();
+                            self.screen = Screen::Login;
+                        }
+                        let mod_updates = self.mods_ui.update_count();
+                        for (screen, label) in [(Screen::Settings, "⚙ Settings"), (Screen::Mods, "Mods"), (Screen::Library, "▶ Games")] {
+                            let sel = self.screen == screen;
+                            let txt = RichText::new(label).size(16.0).strong().color(if sel { Color32::WHITE } else { MUTED });
+                            let b = egui::Button::new(txt).fill(if sel { ACCENT_DIM } else { Color32::TRANSPARENT }).min_size(Vec2::new(96.0, 30.0));
+                            let mut r = ui.add(b);
+                            if screen == Screen::Mods && mod_updates > 0 {
+                                // A count of mods with updates, beside the label.
+                                let c = egui::pos2(r.rect.center().x + 33.0, r.rect.center().y);
+                                ui.painter().circle(c, 9.0, crate::footer::UPDATE_FILL, Stroke::new(1.5_f32, PANEL_BG));
+                                let n = if mod_updates > 9 { "9+".to_string() } else { mod_updates.to_string() };
+                                ui.painter().text(c, Align2::CENTER_CENTER, n, egui::FontId::proportional(12.0), Color32::WHITE);
+                                let s = if mod_updates == 1 { "1 mod has an update" } else { "mods have updates" };
+                                r = r.on_hover_text(if mod_updates == 1 { s.to_string() } else { format!("{mod_updates} {s}") });
+                            }
+                            if r.clicked() {
+                                self.screen = screen;
+                                if screen == Screen::Mods && mod_updates > 0 {
+                                    self.mods_ui.tab = Tab::Installed;
+                                }
+                            }
+                        }
+                    });
+                });
+            });
+    }
+
+    fn library_screen(&mut self, ctx: &egui::Context) {
+        self.top_bar(ctx);
+        if let Some(m) = crate::footer::footer(ctx, &mut self.updater) {
+            self.notify(m, true);
+        }
+        egui::CentralPanel::default().frame(egui::Frame::default().fill(Color32::from_rgb(13, 14, 18)).inner_margin(24.0)).show(ctx, |ui| {
+            let none_imported = self.lib.games.is_empty();
+            let page = ui.available_rect_before_wrap();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                // Centre everything vertically while it fits (its height is
+                // measured each frame and used on the next).
+                ui.add_space(((page.height() - self.library_h) / 2.0).max(0.0));
+                let top = ui.cursor().top();
+                if none_imported {
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("Bring your own discs").size(20.0).strong().color(Color32::WHITE));
+                        ui.label(
+                            RichText::new(
+                                "Re:Compiled runs your own disc images: the .bin is all it needs (a .cue is optional). \
+                                 A BIOS dump is optional too (add one under Settings, BIOS). Nothing is copied or modified. Point it at the folder where you keep them:",
+                            )
+                            .color(MUTED),
+                        );
+                        ui.add_space(6.0);
+                        if ui.add(egui::Button::new(RichText::new("Scan a folder for discs…").size(16.0).color(Color32::WHITE)).fill(ACCENT_DIM)).clicked()
+                            && self.job.is_none()
+                        {
+                            if let Some(d) = rfd::FileDialog::new().set_title("Folder with your disc images and BIOS").pick_folder() {
+                                self.start_scan(d);
+                            }
+                        }
+                        ui.add_space(18.0);
+                    });
+                }
+                // Cards: three across, as large as the page allows (by width
+                // and by height), centred; one column on narrow windows.
+                let gap = 24.0;
+                let avail = ui.available_width();
+                let used_above = ui.cursor().top() - top;
+                let below = if none_imported { 0.0 } else { 70.0 };
+                let height_budget = page.height() - used_above - below;
+                let card_for = |w: f32| -> f32 {
+                    let k = (w / 400.0).clamp(1.0, 1.25);
+                    28.0 + (w - 28.0) * 0.75 + 155.0 * k
+                };
+                let mut card_w = avail.min(460.0);
+                while card_w > 280.0 && card_for(card_w) > height_budget {
+                    card_w -= 10.0;
+                }
+                ui.horizontal_top(|ui| {
+                    ui.add_space(((avail - card_w) / 2.0).max(0.0));
+                    self.game_card(ui, ctx, GameId::Dw1, card_w);
+                });
+                if !none_imported {
+                    ui.add_space(20.0);
+                    ui.vertical_centered(|ui| {
+                        if ui.button("Scan a folder for discs…").clicked() && self.job.is_none() {
+                            if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                                self.start_scan(d);
+                            }
+                        }
+                        ui.label(RichText::new(format!("Data folder: {}", self.paths.root.display())).color(MUTED).small());
+                    });
+                }
+                let h = ui.cursor().top() - top;
+                if (h - self.library_h).abs() > 0.5 {
+                    self.library_h = h;
+                    ctx.request_repaint();
+                }
+            });
+        });
+    }
+
+    fn game_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, g: GameId, w: f32) {
+        let status = self.lib.status(g);
+        let entry = self.lib.games.get(&g).cloned();
+        let thumb = self.thumbnail(ctx, g);
+        let enabled_mods = {
+            let env = crate::mods_page::Env { cfg: &mut self.cfg, paths: &self.paths, lib: &self.lib, running: None };
+            self.mods_ui.active_count(&env, g)
+        };
+        // Text and buttons grow a little with the card.
+        let k = (w / 400.0).clamp(1.0, 1.3);
+        egui::Frame::default().fill(CARD_BG).corner_radius(10.0).inner_margin(14.0).show(ui, |ui| {
+          ui.vertical(|ui| {
+            ui.set_width(w - 28.0);
+            ui.spacing_mut().item_spacing = Vec2::new(8.0 * k, 7.0);
+            // Artwork: last-played screenshot or a placeholder.
+            let art_h = (w - 28.0) * 0.75;
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(w - 28.0, art_h), Sense::hover());
+            if let Some(t) = &thumb {
+                ui.painter().image(t.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            } else {
+                let p = ui.painter();
+                p.rect_filled(rect, 6.0, Color32::from_rgb(22, 26, 34));
+                let n = match g {
+                    GameId::Dw1 => "1",
+                    GameId::Dw2 => "2",
+                    GameId::Dw3 => "3",
+                };
+                p.text(rect.center(), Align2::CENTER_CENTER, n, egui::FontId::proportional(art_h * 0.45), Color32::from_rgb(45, 52, 66));
+                p.text(
+                    rect.center_bottom() - Vec2::new(0.0, 16.0),
+                    Align2::CENTER_CENTER,
+                    "plays from your disc",
+                    egui::FontId::proportional(13.0 * k),
+                    MUTED,
+                );
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new(g.title()).size(20.0 * k).strong().color(Color32::WHITE));
+            match &entry {
+                Some(e) => self.disc_picker(ui, ctx, g, e, w - 28.0, k),
+                None => {
+                    ui.label(RichText::new("Not imported yet").size(13.5 * k).color(MUTED));
+                }
+            }
+            let (chip, col) = match (&status, &entry) {
+                (DiscStatus::Ready, Some(e)) if e.verified => ("✔ Verified dump", OK),
+                (DiscStatus::Ready, Some(_)) => ("⚠ Unverified dump", WARN),
+                (DiscStatus::Missing, _) => ("✖ Disc image missing", BAD),
+                (DiscStatus::Changed, _) => ("✖ Disc image changed", BAD),
+                _ => ("Import your disc to play", MUTED),
+            };
+            ui.label(RichText::new(chip).size(13.5 * k).color(col));
+            ui.add_space(6.0 * k);
+            ui.horizontal(|ui| {
+                let can_play = status == DiscStatus::Ready;
+                let play = ui.add_enabled(
+                    can_play,
+                    egui::Button::new(RichText::new("▶  Play").size(16.0 * k).strong().color(Color32::BLACK))
+                        .fill(ACCENT)
+                        .min_size(Vec2::new(100.0 * k, 32.0 * k)),
+                );
+                let small = |t: String| egui::Button::new(RichText::new(t).size(14.0 * k)).min_size(Vec2::new(0.0, 32.0 * k));
+                if play.clicked() {
+                    self.start_game(g);
+                }
+                if ui.add(small(if entry.is_some() { "Re-import…" } else { "Import disc…" }.to_string())).clicked() && self.job.is_none() {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .set_title(format!("Select your {} disc image", g.title()))
+                        .add_filter("Disc image", &["cue", "bin", "CUE", "BIN"])
+                        .pick_file()
+                    {
+                        self.start_import_disc(p);
+                    }
+                }
+                let label = if enabled_mods > 0 { format!("Mods ({enabled_mods})") } else { "Mods".to_string() };
+                if ui.add(small(label)).on_hover_text(format!("Mods that load for {}", g.title())).clicked() {
+                    self.mods_ui.game_filter = Some(g);
+                    self.mods_ui.search.clear();
+                    self.mods_ui.tab = Tab::Installed;
+                    self.screen = Screen::Mods;
+                }
+            });
+          });
+        });
+    }
+
+    /// The line under a game's title naming the disc that plays (release and
+    /// serial). Clicking it unrolls a list of every disc imported for the
+    /// game (other regions, other copies) to choose another.
+    fn disc_picker(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, g: GameId, chosen: &GameEntry, list_w: f32, k: f32) {
+        let open_id = egui::Id::new(("disc-list", g.slug()));
+        let mut open = ctx.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
+        let count = self.lib.discs_for(g).len();
+        let arrow = if count < 2 { "" } else if open { "  ⏶" } else { "  ⏷" };
+        // A highlight behind the line while it is hovered or open, painted
+        // beneath the text (its slot is reserved first).
+        let bg = ui.painter().add(egui::Shape::Noop);
+        let line = format!("{}  ·  {}{arrow}", chosen.ident.title, chosen.ident.serial);
+        let r = ui.add(egui::Label::new(RichText::new(line).size(13.5 * k).color(MUTED)).sense(Sense::click()).selectable(false));
+        if r.hovered() || open {
+            ui.painter().set(bg, egui::Shape::rect_filled(r.rect.expand2(Vec2::new(5.0, 2.0)), 4.0, Color32::from_gray(38)));
+        }
+        let r = r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(if count < 2 {
+            "The disc this game plays. Import another region or copy to choose between them here.".to_string()
+        } else {
+            format!("Choose which of your {count} discs plays")
+        });
+        if r.clicked() {
+            open = !open;
+        }
+        let t = ctx.animate_bool_with_time(open_id.with("unroll"), open, 0.16);
+        let mut pick = None;
+        let mut forget = None;
+        if t > 0.0 {
+            let discs: Vec<GameEntry> = self.lib.discs_for(g).into_iter().cloned().collect();
+            let height_id = open_id.with("height");
+            let full_h: f32 = ctx.data(|d| d.get_temp(height_id)).unwrap_or(0.0);
+            let area = egui::Area::new(open_id.with("area")).order(egui::Order::Foreground).fixed_pos(r.rect.left_bottom() + Vec2::new(-6.0, 6.0)).show(ctx, |ui| {
+                // Unrolls: only the top `t` of the list shows while animating.
+                let shown = egui::Rect::from_min_size(ui.max_rect().min - Vec2::splat(1.0), Vec2::new(list_w + 14.0, full_h * t + 2.0));
+                ui.set_clip_rect(shown.intersect(ui.clip_rect()));
+                egui::Frame::default()
+                    .fill(Color32::from_rgb(22, 25, 32))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_gray(60)))
+                    .corner_radius(8.0)
+                    .inner_margin(6.0)
+                    .show(ui, |ui| {
+                        ui.set_width(list_w);
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        for (i, e) in discs.iter().enumerate() {
+                            let is_chosen = e.bin == chosen.bin;
+                            let status = dwrc_runtime::library::disc_status(e);
+                            let playable = status == DiscStatus::Ready;
+                            let (chip, col) = match status {
+                                DiscStatus::Ready if e.verified => ("✔ Verified dump", OK),
+                                DiscStatus::Ready => ("⚠ Unverified dump", WARN),
+                                DiscStatus::Changed => ("✖ Changed since import", BAD),
+                                _ => ("✖ Missing", BAD),
+                            };
+                            let row = ui.scope_builder(egui::UiBuilder::new().id_salt(("disc", g.slug(), i)).sense(Sense::click()), |ui| {
+                                ui.style_mut().interaction.selectable_labels = false;
+                                let hover = ui.response().contains_pointer() && playable && !is_chosen;
+                                let fill = if is_chosen {
+                                    ACCENT_DIM
+                                } else if hover {
+                                    Color32::from_gray(40)
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+                                egui::Frame::default().fill(fill).corner_radius(6.0).inner_margin(egui::Margin::symmetric(8, 5)).show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        // The text keeps to the card's width (long file names
+                                        // are shortened), leaving room on the right.
+                                        let text_w = ui.available_width() - 44.0 * k;
+                                        ui.vertical(|ui| {
+                                            ui.set_width(text_w);
+                                            let name = RichText::new(format!("{}  ·  {}", e.ident.title, e.ident.serial)).size(13.5 * k);
+                                            let name = if is_chosen { name.strong().color(Color32::WHITE) } else { name.color(Color32::from_gray(210)) };
+                                            ui.add(egui::Label::new(name).truncate());
+                                            ui.horizontal(|ui| {
+                                                ui.label(RichText::new(chip).size(12.0 * k).color(col));
+                                                ui.add(egui::Label::new(RichText::new(e.file_name()).size(12.0 * k).color(MUTED)).truncate())
+                                                    .on_hover_text(e.bin.display().to_string());
+                                            });
+                                        });
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            if is_chosen {
+                                                ui.label(RichText::new("Plays").size(12.0 * k).color(Color32::WHITE));
+                                            } else if ui
+                                                .small_button("✖")
+                                                .on_hover_text("Remove from this list (the file itself is not touched)")
+                                                .clicked()
+                                            {
+                                                forget = Some(e.bin.clone());
+                                            }
+                                        });
+                                    });
+                                });
+                            });
+                            let resp = row.response;
+                            if !is_chosen && playable {
+                                if resp.clone().on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                    pick = Some(e.bin.clone());
+                                }
+                            } else if !playable && !is_chosen {
+                                resp.on_hover_text("This disc image cannot be played until it is found again (scan its folder) or re-imported");
+                            }
+                        }
+                    });
+            });
+            ctx.data_mut(|d| d.insert_temp(height_id, area.response.rect.height()));
+            // Close on a click elsewhere, or Esc.
+            let outside = ctx.input(|i| {
+                i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !area.response.rect.contains(p) && !r.rect.contains(p))
+            });
+            if open && (outside || ctx.input(|i| i.key_pressed(Key::Escape))) {
+                open = false;
+            }
+            if t < 1.0 {
+                ctx.request_repaint();
+            }
+        }
+        if let Some(bin) = pick {
+            open = false;
+            self.lib.select(g, &bin);
+            self.save_library();
+        }
+        if let Some(bin) = forget {
+            self.lib.forget(g, &bin);
+            self.save_library();
+        }
+        ctx.data_mut(|d| d.insert_temp(open_id, open));
+    }
+
+    fn save_library(&mut self) {
+        if let Err(e) = self.lib.save(&self.paths) {
+            self.notify(format!("Could not save library: {e}"), true);
+        }
+    }
+
+    fn settings_screen(&mut self, ctx: &egui::Context) {
+        self.top_bar(ctx);
+        egui::CentralPanel::default().frame(egui::Frame::default().fill(Color32::from_rgb(13, 14, 18)).inner_margin(24.0)).show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.set_max_width(720.0);
+                let mut changed = false;
+                section(ui, "Video", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Scaling filter");
+                        changed |= ui.radio_value(&mut self.cfg.video.filter, Filter::Nearest, "Sharp (original pixels)").changed();
+                        changed |= ui.radio_value(&mut self.cfg.video.filter, Filter::Linear, "Smooth").changed();
+                        let crt_ok = self.crt.is_some();
+                        let r = ui.add_enabled(crt_ok, egui::RadioButton::new(self.cfg.video.filter == Filter::Crt, "CRT"));
+                        let r = match &self.crt_error {
+                            Some(e) => r.on_disabled_hover_text(format!("The CRT filter is not available on this computer: {e}")),
+                            None => r.on_hover_text("Scanlines and phosphors, like a CRT television"),
+                        };
+                        if r.clicked() {
+                            self.cfg.video.filter = Filter::Crt;
+                            changed = true;
+                        }
+                    });
+                    if self.cfg.video.filter == Filter::Crt {
+                        let crt = &mut self.cfg.video.crt;
+                        egui::Grid::new("crt").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                            for (label, value, tip) in [
+                                ("Scanlines", &mut crt.scanlines, "How dark the gaps between the picture's lines are"),
+                                ("Phosphor mask", &mut crt.mask, "How visible the red, green and blue stripes are"),
+                                ("Glow", &mut crt.glow, "Light spreading softly through the glass around bright parts of the picture"),
+                                ("Screen curvature", &mut crt.curvature, "0 is a flat screen"),
+                            ] {
+                                ui.label(label).on_hover_text(tip);
+                                changed |= ui.add(egui::Slider::new(value, 0.0..=1.0).show_value(false)).changed();
+                                ui.end_row();
+                            }
+                        });
+                        if ui.button("Reset CRT settings").clicked() {
+                            self.cfg.video.crt = Default::default();
+                            changed = true;
+                        }
+                        if self.crt.is_none() {
+                            ui.label(RichText::new("The CRT filter is not available on this computer, so Smooth is used.").color(WARN).small());
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Aspect ratio");
+                        changed |= ui.radio_value(&mut self.cfg.video.aspect, Aspect::Tv4x3, "4:3 TV").changed();
+                        changed |= ui.radio_value(&mut self.cfg.video.aspect, Aspect::IntegerScale, "Integer scale").changed();
+                        changed |= ui.radio_value(&mut self.cfg.video.aspect, Aspect::Stretch, "Stretch").changed();
+                    });
+                    let before = (self.cfg.video.widescreen, self.cfg.video.widescreen_ui);
+                    ui.horizontal(|ui| {
+                        ui.label("Widescreen").on_hover_text(
+                            "Draws more of the picture at the sides: the parts of the 3D scenes the console cuts off at the edge of its 4:3 screen. Nothing is stretched.",
+                        );
+                        for w in Widescreen::ALL {
+                            ui.radio_value(&mut self.cfg.video.widescreen, w, w.label());
+                        }
+                    });
+                    if self.cfg.video.widescreen != Widescreen::Off {
+                        ui.checkbox(&mut self.cfg.video.widescreen_ui, "Widescreen UI").on_hover_text(
+                            "Menus, panels and HUD near the left or right edge of the screen move out to the edges of the wider picture, as a game made for widescreen would place them (with mods' pictures near an edge). Everything else stays where the game puts it.",
+                        );
+                    }
+                    if (self.cfg.video.widescreen, self.cfg.video.widescreen_ui) != before {
+                        changed = true;
+                        if let Some(e) = &self.emu {
+                            e.send(EmuCmd::Widescreen(self.cfg.video.widescreen, self.cfg.video.widescreen_ui));
+                        }
+                    }
+                    if self.cfg.video.widescreen != Widescreen::Off {
+                        ui.label(
+                            RichText::new(
+                                "The sides show what the game drew past the edge of the screen. Where it drew nothing there (menus, movies, pre-drawn screens, things a PlayStation would not show), they stay black.",
+                            )
+                            .color(MUTED)
+                            .small(),
+                        );
+                    }
+                    changed |= ui.checkbox(&mut self.cfg.video.show_fps, "Show frame rate").changed();
+                    changed |= ui.checkbox(&mut self.cfg.video.start_fullscreen, "Start in fullscreen (F11 toggles)").changed();
+                    changed |= ui
+                        .checkbox(&mut self.cfg.video.pal_60hz, "Digimon World 2003 at 60 Hz")
+                        .on_hover_text(
+                            "The European release has a 60 Hz mode of its own, which plays at the speed of the USA release                              with the same music tempo. Untick it for the original 50 Hz, which plays about 17% slower.                              Takes effect the next time the game starts.",
+                        )
+                        .changed();
+                });
+                section(ui, "Audio", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Volume");
+                        if ui.add(egui::Slider::new(&mut self.cfg.audio.volume, 0.0..=1.0).show_value(false)).changed() {
+                            changed = true;
+                        }
+                        changed |= ui.checkbox(&mut self.cfg.audio.muted, "Mute").changed();
+                    });
+                    if let Some(e) = &self.audio_error {
+                        ui.label(RichText::new(format!("Audio unavailable: {e}")).color(BAD));
+                    }
+                });
+                let mut add_bios = false;
+                let mut remove_bios: Option<usize> = None;
+                section(ui, "BIOS", |ui| {
+                    ui.label(
+                        RichText::new(
+                            "A BIOS dumped from your own console is optional. Without one, games start with the built-in OpenBIOS \
+                             (open source, MIT). Game code runs the same with either; your own BIOS also makes the BIOS's own routines \
+                             exact and allows fast boot. Saves work with both.",
+                        )
+                        .color(MUTED),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Use");
+                        changed |= ui
+                            .radio_value(&mut self.cfg.emulation.bios, BiosMode::Auto, "Your console's BIOS when added, otherwise built-in")
+                            .changed();
+                        changed |= ui.radio_value(&mut self.cfg.emulation.bios, BiosMode::BuiltIn, "Always the built-in BIOS").changed();
+                    });
+                    ui.add_space(4.0);
+                    egui::Grid::new("bios-regions").num_columns(2).spacing([18.0, 4.0]).show(ui, |ui| {
+                        for region in [dwrc_disc::ident::Region::NtscU, dwrc_disc::ident::Region::Pal, dwrc_disc::ident::Region::NtscJ] {
+                            ui.label(region_label(region));
+                            match self.lib.bios_choice(region, self.cfg.emulation.bios) {
+                                dwrc_runtime::library::BiosChoice::Console(b) => {
+                                    let name = b.info.known_name.clone().unwrap_or_else(|| b.info.version.clone());
+                                    ui.label(RichText::new(format!("✔ {name}")).color(OK));
+                                }
+                                dwrc_runtime::library::BiosChoice::BuiltIn => {
+                                    ui.label(RichText::new("built-in OpenBIOS").color(MUTED));
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+                    if !self.lib.bios.is_empty() {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Your BIOS files").strong());
+                        for (i, b) in self.lib.bios.iter().enumerate() {
+                            ui.horizontal_wrapped(|ui| {
+                                let name = b.info.known_name.clone().unwrap_or_else(|| b.info.version.clone());
+                                ui.label(RichText::new(name).strong());
+                                ui.label(RichText::new(region_label(b.info.region)).color(MUTED));
+                                if b.info.known_name.is_some() {
+                                    ui.label(RichText::new("✔ verified dump").color(OK));
+                                } else {
+                                    ui.label(RichText::new("unverified dump").color(WARN));
+                                }
+                                if !b.path.exists() {
+                                    ui.label(RichText::new("✖ file missing").color(BAD));
+                                }
+                                if ui.button("Remove").on_hover_text("Stop using this BIOS. The file itself is not deleted.").clicked() {
+                                    remove_bios = Some(i);
+                                }
+                            });
+                            ui.label(RichText::new(b.path.display().to_string()).color(MUTED).small());
+                        }
+                    }
+                    ui.add_space(4.0);
+                    if ui.button("Add BIOS…").clicked() {
+                        add_bios = true;
+                    }
+                    changed |= ui
+                        .checkbox(
+                            &mut self.cfg.emulation.fast_boot,
+                            "Fast boot (skip the PlayStation logo; with your own BIOS only, the built-in one boots straight into the game)",
+                        )
+                        .changed();
+                });
+                if add_bios && self.job.is_none() {
+                    if let Some(p) = rfd::FileDialog::new().set_title("Select your PlayStation BIOS dump").pick_file() {
+                        self.add_bios(p);
+                    }
+                }
+                if let Some(i) = remove_bios {
+                    let b = self.lib.bios.remove(i);
+                    let _ = self.lib.save(&self.paths);
+                    let name = b.info.known_name.unwrap_or(b.info.version);
+                    self.notify(format!("Removed BIOS {name} from the list (the file was not deleted)."), false);
+                }
+                section(ui, "Emulation", |ui| {
+                    changed |= ui.checkbox(&mut self.cfg.emulation.memory_card_2, "Insert a memory card in slot 2").changed();
+                    ui.horizontal(|ui| {
+                        ui.label("CPU engine");
+                        changed |= ui.radio_value(&mut self.cfg.emulation.engine, EngineKind::Recompiled, "Recompiled (native)").changed();
+                        changed |= ui.radio_value(&mut self.cfg.emulation.engine, EngineKind::Interpreter, "Reference interpreter").changed();
+                        changed |= ui.radio_value(&mut self.cfg.emulation.engine, EngineKind::Validate, "Validate (developers)").changed();
+                    });
+                    ui.label(
+                        RichText::new("Both engines run the same hardware model; the interpreter is the accuracy reference.").color(MUTED).small(),
+                    );
+                });
+                section(ui, "Controls", |ui| {
+                    ui.label(RichText::new("Click a binding, then press a key. Gamepads are detected automatically.").color(MUTED).small());
+                    let pads = self.input.gamepad_names();
+                    ui.label(if pads.is_empty() { "No gamepad connected".to_string() } else { format!("Gamepad: {}", pads.join(", ")) });
+                    egui::Grid::new("keys").num_columns(4).spacing([16.0, 6.0]).show(ui, |ui| {
+                        for (i, b) in input::EDITABLE.iter().enumerate() {
+                            let name = input::button_name(*b);
+                            let key = self.cfg.input.keyboard.get(&name).cloned().unwrap_or_else(|| "—".into());
+                            ui.label(pretty_button(*b));
+                            let txt = if self.rebinding == Some(*b) { "press a key…".to_string() } else { key };
+                            if ui.add(egui::Button::new(txt).min_size(Vec2::new(110.0, 0.0))).clicked() {
+                                self.rebinding = Some(*b);
+                            }
+                            if i % 2 == 1 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+                    let mouse = self.cfg.input.mouse;
+                    ui.checkbox(&mut self.cfg.input.mouse, "Mouse").on_hover_text(
+                        "Click the game's picture to play: left clicks pick what you click (menu options, tabs, battle commands) or press Confirm, right clicks open the menu or go back. Digimon World 1 and Digimon World 2003. The keyboard and gamepad keep working alongside it.",
+                    );
+                    if ui.button("Reset to defaults").clicked() {
+                        self.cfg.input = Default::default();
+                        changed = true;
+                    }
+                    if self.cfg.input.mouse != mouse {
+                        changed = true;
+                        if let Some(e) = &self.emu {
+                            e.send(EmuCmd::Mouse(self.cfg.input.mouse));
+                        }
+                    }
+                });
+                section(ui, "Data", |ui| {
+                    ui.label(format!("Saves, settings and generated data: {}", self.paths.root.display()));
+                    ui.label(
+                        RichText::new(if self.paths.portable {
+                            "Portable mode is on (portable.txt next to the program)."
+                        } else {
+                            "Tip: put an empty file named portable.txt next to the program to keep everything beside it."
+                        })
+                        .color(MUTED)
+                        .small(),
+                    );
+                });
+                section(ui, "About", |ui| {
+                    changed |= self.updater.settings(ui, &mut self.cfg.updates.check_on_start);
+                });
+                if let Some(b) = self.rebinding {
+                    let pressed = ctx.input(|i| {
+                        i.events.iter().find_map(|e| match e {
+                            egui::Event::Key { key, pressed: true, .. } => Some(*key),
+                            _ => None,
+                        })
+                    });
+                    if let Some(k) = pressed {
+                        if k != Key::Escape {
+                            self.cfg.input.keyboard.insert(input::button_name(b), k.name().to_string());
+                            changed = true;
+                        }
+                        self.rebinding = None;
+                    }
+                }
+                if changed {
+                    self.audio.set_volume(if self.cfg.audio.muted { 0.0 } else { self.cfg.audio.volume });
+                    self.save_cfg();
+                }
+            });
+        });
+    }
+
+    fn mods_screen(&mut self, ctx: &egui::Context) {
+        self.top_bar(ctx);
+        egui::CentralPanel::default().frame(egui::Frame::default().fill(Color32::from_rgb(13, 14, 18)).inner_margin(24.0)).show(ctx, |ui| {
+            let mut env = crate::mods_page::Env { cfg: &mut self.cfg, paths: &self.paths, lib: &self.lib, running: self.emu.as_ref().map(|e| e.game) };
+            if self.mods_ui.show(ui, &mut env) {
+                self.save_cfg();
+            }
+        });
+    }
+
+    fn playing_screen(&mut self, ctx: &egui::Context) {
+        let Some(emu) = &self.emu else {
+            self.screen = Screen::Library;
+            return;
+        };
+        let status = emu.shared.status.lock().unwrap().clone();
+        if let Some(err) = status.error.clone() {
+            self.stop_game();
+            self.screen = Screen::Library;
+            self.notify(format!("Could not start the game: {err}"), true);
+            return;
+        }
+        // Input
+        let overlay_open = self.show_pause || self.show_mods_overlay;
+        let pad = self.input.poll(ctx, &self.cfg.input.keyboard, !overlay_open);
+        let emu = self.emu.as_ref().unwrap();
+        emu.set_pad(0, if overlay_open { Default::default() } else { pad });
+        let (esc, f10, f12, tab) =
+            ctx.input(|i| (i.key_pressed(Key::Escape), i.key_pressed(Key::F10), i.key_pressed(Key::F12), i.key_down(Key::Tab)));
+        if esc {
+            if self.show_mods_overlay {
+                self.show_mods_overlay = false;
+            } else {
+                self.show_pause = !self.show_pause;
+            }
+        }
+        if f10 {
+            self.show_mods_overlay = !self.show_mods_overlay;
+        }
+        emu.shared.paused.store(overlay_open, Ordering::Relaxed);
+        emu.shared.fast_forward.store(tab && !overlay_open, Ordering::Relaxed);
+        // Key presses go to the mods too (save states and the like), except
+        // the keys the launcher itself uses. The physical key is used, so
+        // Shift+1 is "1" with shift held on any keyboard layout.
+        if !overlay_open {
+            let keys: Vec<(egui::Key, egui::Modifiers)> = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::Key { key, physical_key, pressed: true, repeat: false, modifiers } => Some((physical_key.unwrap_or(*key), *modifiers)),
+                        _ => None,
+                    })
+                    .filter(|(k, _)| !matches!(k, Key::Escape | Key::F10 | Key::F11 | Key::F12 | Key::Tab))
+                    .collect()
+            });
+            for (k, m) in keys {
+                emu.send(EmuCmd::Key { key: k.name().to_string(), shift: m.shift, ctrl: m.ctrl, alt: m.alt });
+            }
+        }
+        for n in std::mem::take(&mut *emu.shared.notices.lock().unwrap()) {
+            self.osd.push((n, Instant::now()));
+        }
+        if let Some(list) = emu.shared.overlays.lock().unwrap().take() {
+            let opts = if matches!(self.cfg.video.filter, Filter::Nearest) { TextureOptions::NEAREST } else { TextureOptions::LINEAR };
+            let old = std::mem::take(&mut self.overlays);
+            for o in list {
+                // Keep the texture of an image that is still the same.
+                let tex = match old.iter().find(|(p, _)| Arc::ptr_eq(&p.image, &o.image)) {
+                    Some((_, t)) => t.clone(),
+                    None => {
+                        let img = egui::ColorImage::from_rgba_unmultiplied([o.image.width as usize, o.image.height as usize], &o.image.rgba);
+                        ctx.load_texture(format!("mod image {}", o.key), img, opts)
+                    }
+                };
+                self.overlays.push((o, tex));
+            }
+        }
+        self.osd.retain(|(_, t)| t.elapsed() < OSD_TIME);
+        if self.osd.len() > 4 {
+            self.osd.drain(..self.osd.len() - 4);
+        }
+        // Frame upload
+        {
+            let f = emu.shared.frame.lock().unwrap();
+            if f.seq != self.last_seq && f.width > 0 {
+                self.last_seq = f.seq;
+                let mut rgba = Vec::with_capacity(f.pixels.len() * 4);
+                for p in &f.pixels {
+                    rgba.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]);
+                }
+                if let (Filter::Crt, Some(crt)) = (self.cfg.video.filter, &self.crt) {
+                    crt.set_frame(f.seq, f.width, f.height, &rgba);
+                }
+                let img = egui::ColorImage::from_rgba_unmultiplied([f.width as usize, f.height as usize], &rgba);
+                let opts = match self.cfg.video.filter {
+                    Filter::Nearest => TextureOptions::NEAREST,
+                    Filter::Linear | Filter::Crt => TextureOptions::LINEAR,
+                };
+                match &mut self.game_tex {
+                    Some(t) => t.set(img, opts),
+                    None => self.game_tex = Some(ctx.load_texture("game", img, opts)),
+                }
+                self.game_size = (f.width, f.height);
+            }
+            if f12 && f.width > 0 {
+                let dir = self.paths.screenshots_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                let name = format!(
+                    "{}-{}.png",
+                    emu.game.slug(),
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+                );
+                let r = save_png(&dir.join(&name), f.width, f.height, &f.pixels);
+                drop(f);
+                match r {
+                    Ok(_) => self.notify(format!("Screenshot saved: {name}"), false),
+                    Err(e) => self.notify(format!("Screenshot failed: {e}"), true),
+                }
+            }
+        }
+        // Clicks on the picture for mouse support (u, v across its 4:3 part).
+        let mut clicks: Vec<(bool, f32, f32)> = Vec::new();
+        egui::CentralPanel::default().frame(egui::Frame::default().fill(Color32::BLACK)).show(ctx, |ui| {
+            let avail = ui.max_rect();
+            let mut image_rects = Vec::new();
+            if let Some(t) = &self.game_tex {
+                let (w, h) = (self.game_size.0 as f32, self.game_size.1 as f32);
+                // A widescreen picture is this much wider than 4:3 (the
+                // frame itself is wider, with the console's pixel shape).
+                let wide = status.stretch.max(1.0);
+                let size = match self.cfg.video.aspect {
+                    Aspect::Stretch => avail.size(),
+                    Aspect::Tv4x3 => {
+                        let s = (avail.width() / (4.0 * wide)).min(avail.height() / 3.0);
+                        Vec2::new(s * 4.0 * wide, s * 3.0)
+                    }
+                    Aspect::IntegerScale => {
+                        let k = (avail.width() / w).min(avail.height() / h).floor().max(1.0);
+                        Vec2::new(w * k, h * k)
+                    }
+                };
+                let rect = egui::Rect::from_center_size(avail.center(), size);
+                match (self.cfg.video.filter, &self.crt) {
+                    (Filter::Crt, Some(crt)) => {
+                        let crt = crt.clone();
+                        let c = self.cfg.video.crt;
+                        let params = crate::crt::Params { scanlines: c.scanlines, mask: c.mask, glow: c.glow, curvature: c.curvature };
+                        let cb = eframe::egui_glow::CallbackFn::new(move |info, painter| crt.paint(painter, &info, params));
+                        ui.painter().add(egui::PaintCallback { rect, callback: Arc::new(cb) });
+                    }
+                    _ => {
+                        ui.painter().image(t.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                    }
+                }
+                // Mods' images, on a 320×240 grid over the console's picture
+                // (between any widescreen strips).
+                let inner = egui::Rect::from_center_size(rect.center(), Vec2::new(rect.width() / wide, rect.height()));
+                if self.cfg.input.mouse && !overlay_open {
+                    ui.input(|i| {
+                        for e in &i.events {
+                            if let egui::Event::PointerButton { pos, button, pressed: true, .. } = e {
+                                let right = match button {
+                                    egui::PointerButton::Primary => false,
+                                    egui::PointerButton::Secondary => true,
+                                    _ => continue,
+                                };
+                                if rect.contains(*pos) {
+                                    clicks.push((right, (pos.x - inner.min.x) / inner.width(), (pos.y - inner.min.y) / inner.height()));
+                                }
+                            }
+                        }
+                    });
+                }
+                let (sx, sy) = (inner.width() / dwrc_mods::overlay::GRID_W, inner.height() / dwrc_mods::overlay::GRID_H);
+                // With Widescreen UI, images near an edge follow it out.
+                let side = (rect.width() - inner.width()) / 2.0;
+                for (o, tex) in &self.overlays {
+                    let [l, t, w, h] = o.rect();
+                    let out = if status.ui_moved { o.edge() as f32 * side } else { 0.0 };
+                    let r = egui::Rect::from_min_size(inner.min + Vec2::new(l * sx + out, t * sy), Vec2::new(w * sx, h * sy));
+                    image_rects.push(r);
+                    ui.painter().with_clip_rect(rect).image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                }
+            } else {
+                ui.painter().text(avail.center(), Align2::CENTER_CENTER, "Starting…", egui::FontId::proportional(20.0), MUTED);
+            }
+            if self.cfg.video.show_fps {
+                ui.painter().text(
+                    avail.left_top() + Vec2::new(8.0, 6.0),
+                    Align2::LEFT_TOP,
+                    format!("{:.1} fps · {:.0}% · {}", status.fps, status.speed * 100.0, status.engine),
+                    egui::FontId::monospace(13.0),
+                    Color32::from_rgb(200, 255, 200),
+                );
+            }
+            if status.mod_speed > 1 {
+                // Below any mod image in the top right corner.
+                let mut y = 10.0;
+                for r in &image_rects {
+                    if r.right() > avail.right() - 140.0 && r.top() < avail.top() + y + 26.0 {
+                        y = f32::max(y, r.bottom() - avail.top() + 6.0);
+                    }
+                }
+                fast_forward_badge(ui.painter(), avail.right_top() + Vec2::new(-12.0, y), status.mod_speed);
+            }
+            let top = if self.cfg.video.show_fps { 30.0 } else { 10.0 };
+            for (i, (msg, t)) in self.osd.iter().enumerate() {
+                osd_message(ui.painter(), avail.left_top() + Vec2::new(12.0, top + i as f32 * 32.0), msg, t.elapsed());
+            }
+            if !self.osd.is_empty() {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            if let Some(emu) = &self.emu {
+                let udp_ok = emu.shared.mmo_udp_ok.load(Ordering::Relaxed);
+                let is_online = self.mmo_session.is_online;
+                if let Ok(guard) = emu.shared.mmo_player.lock() {
+                    if let Some((tf, area_name)) = guard.as_ref() {
+                        draw_ingame_map_layout(
+                            ui.painter(),
+                            avail.right_top() + Vec2::new(-12.0, 42.0),
+                            tf,
+                            area_name,
+                            is_online,
+                            udp_ok,
+                        );
+                    }
+                }
+            }
+        });
+        if let Some(e) = &self.emu {
+            for (right, u, v) in clicks {
+                e.send(EmuCmd::Click { right, u, v });
+            }
+        }
+        if self.show_pause {
+            let mut quit = false;
+            let mut reset = false;
+            egui::Window::new("Paused")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_min_width(260.0);
+                    ui.label(RichText::new(&status.title).strong());
+                    ui.label(RichText::new(format!("Engine: {} · BIOS: {}", status.engine, status.bios)).color(MUTED).small());
+                    ui.add_space(6.0);
+                    let b = |ui: &mut egui::Ui, t: &str| ui.add(egui::Button::new(t).min_size(Vec2::new(240.0, 30.0))).clicked();
+                    if b(ui, "Resume (Esc)") {
+                        self.show_pause = false;
+                    }
+                    if b(ui, "Mod manager (F10)") {
+                        self.show_pause = false;
+                        self.show_mods_overlay = true;
+                    }
+                    if b(ui, "Reset console") {
+                        reset = true;
+                    }
+                    if b(ui, if self.fullscreen { "Leave fullscreen (F11)" } else { "Fullscreen (F11)" }) {
+                        self.toggle_fullscreen(ctx);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Volume");
+                        if ui.add(egui::Slider::new(&mut self.cfg.audio.volume, 0.0..=1.0).show_value(false)).changed() {
+                            self.audio.set_volume(if self.cfg.audio.muted { 0.0 } else { self.cfg.audio.volume });
+                        }
+                    });
+                    ui.add_space(4.0);
+                    if b(ui, "Quit to game list") {
+                        quit = true;
+                    }
+                    ui.label(RichText::new("Memory cards save automatically.").color(MUTED).small());
+                });
+            if reset {
+                if let Some(e) = &self.emu {
+                    e.send(EmuCmd::Reset);
+                }
+                self.show_pause = false;
+            }
+            if quit {
+                self.stop_game();
+                self.save_cfg();
+                self.screen = Screen::Library;
+                return;
+            }
+        }
+        if self.show_mods_overlay {
+            let g = self.emu.as_ref().unwrap().game;
+            let mut open = true;
+            let mut restart = false;
+            egui::Window::new(format!("Mods – {}", g.title()))
+                .open(&mut open)
+                .default_width(560.0)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    if !status.mod_log.is_empty() {
+                        egui::CollapsingHeader::new("Mod log").default_open(false).show(ui, |ui| {
+                            for l in &status.mod_log {
+                                ui.label(RichText::new(l).monospace().small());
+                            }
+                        });
+                    }
+                    let mut changed = false;
+                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                        let mut env = crate::mods_page::Env { cfg: &mut self.cfg, paths: &self.paths, lib: &self.lib, running: Some(g) };
+                        changed = self.mods_ui.game_panel(ui, &mut env, g);
+                    });
+                    if changed {
+                        self.save_cfg();
+                    }
+                    ui.label(RichText::new("Install, update and reorder mods on the Mods page (press Esc, then Quit to game list).").color(MUTED).small());
+                    if self.mods_ui.changed_while_running {
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Changes apply when the game restarts.").color(WARN));
+                            if ui.button("Restart now").clicked() {
+                                restart = true;
+                            }
+                        });
+                    }
+                });
+            if !open {
+                self.show_mods_overlay = false;
+            }
+            if restart {
+                self.start_game(g);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    /// Files dropped on the window: a mod `.zip` is installed, a disc image
+    /// is imported. (Not while playing, so a stray drop never interrupts.)
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let (hovering, dropped) = ctx.input(|i| (!i.raw.hovered_files.is_empty(), i.raw.dropped_files.clone()));
+        self.files_hovering = hovering && self.screen != Screen::Playing;
+        if self.screen == Screen::Playing {
+            return;
+        }
+        let mut files: Vec<std::path::PathBuf> = std::mem::take(&mut self.open_files);
+        files.extend(dropped.into_iter().filter_map(|f| f.path));
+        for path in files {
+            self.open_file(ctx, path);
+        }
+    }
+
+    fn add_bios(&mut self, path: std::path::PathBuf) {
+        match self.lib.import_bios(&path) {
+            Ok(info) => {
+                let _ = self.lib.save(&self.paths);
+                let what = info.known_name.clone().unwrap_or(info.version.clone());
+                let note = if info.known_name.is_some() { "verified" } else { "not a verified dump, but usable" };
+                self.notify(format!("Added BIOS {what} ({}, {note}).", region_label(info.region)), false);
+            }
+            Err(e) => self.notify(e.to_string(), true),
+        }
+    }
+
+    fn open_file(&mut self, ctx: &egui::Context, path: std::path::PathBuf) {
+        let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        let bios_sized = std::fs::metadata(&path).map(|m| m.len() == dwrc_runtime::bios::BIOS_SIZE as u64).unwrap_or(false);
+        if bios_sized && matches!(ext.as_str(), "bin" | "rom" | "") {
+            self.screen = Screen::Settings;
+            self.add_bios(path);
+            return;
+        }
+        match ext.as_str() {
+            "zip" => {
+                self.screen = Screen::Mods;
+                let env = crate::mods_page::Env { cfg: &mut self.cfg, paths: &self.paths, lib: &self.lib, running: self.emu.as_ref().map(|e| e.game) };
+                self.mods_ui.import_zip(ctx, &env, path);
+            }
+            "cue" | "bin" if self.job.is_none() => {
+                self.screen = Screen::Library;
+                self.start_import_disc(path);
+            }
+            _ => self.notify(format!("{} is not a mod (.zip), a disc image (.bin/.cue) or a BIOS dump.", path.display()), true),
+        }
+    }
+
+    fn overlays(&mut self, ctx: &egui::Context) {
+        if self.files_hovering {
+            let screen = ctx.screen_rect();
+            let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop")));
+            p.rect_filled(screen, 0.0, Color32::from_black_alpha(190));
+            p.rect_stroke(screen.shrink(18.0), 12.0, Stroke::new(3.0_f32, ACCENT), egui::StrokeKind::Inside);
+            p.text(screen.center(), Align2::CENTER_CENTER, "Drop a mod .zip to install it,\na disc image (.bin/.cue) to import it,\nor a BIOS dump to add it", egui::FontId::proportional(24.0), Color32::WHITE);
+            ctx.request_repaint();
+        }
+        if let Some(job) = &self.job {
+            let (what, f) = job.progress.lock().unwrap().clone();
+            egui::Window::new(&job.label)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_min_width(360.0);
+                    ui.label(what);
+                    ui.add(egui::ProgressBar::new(f).show_percentage());
+                    ui.label(RichText::new("Checking the image against known-good dumps (SHA-1)…").color(MUTED).small());
+                });
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+        if let Some((msg, t, err)) = &self.toast {
+            let age = t.elapsed().as_secs_f32();
+            let life = if *err { 9.0 } else { 6.0 };
+            if age > life {
+                self.toast = None;
+            } else {
+                egui::Area::new(egui::Id::new("toast")).anchor(Align2::CENTER_BOTTOM, [0.0, -60.0]).show(ctx, |ui| {
+                    egui::Frame::default()
+                        .fill(if *err { Color32::from_rgb(70, 24, 24) } else { Color32::from_rgb(24, 40, 30) })
+                        .stroke(Stroke::new(1.0_f32, if *err { BAD } else { OK }))
+                        .corner_radius(8.0)
+                        .inner_margin(12.0)
+                        .show(ui, |ui| {
+                            ui.set_max_width(560.0);
+                            ui.label(RichText::new(msg).color(Color32::WHITE));
+                        });
+                });
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_job();
+        self.updater.poll(ctx);
+        let mut env = crate::mods_page::Env { cfg: &mut self.cfg, paths: &self.paths, lib: &self.lib, running: self.emu.as_ref().map(|e| e.game) };
+        // Mod indexes and mod updates: asked for when the launcher starts.
+        self.mods_ui.tick(ctx, &env);
+        if self.mods_ui.poll(&mut env) {
+            self.save_cfg();
+        }
+        for (msg, err) in std::mem::take(&mut self.mods_ui.toasts) {
+            self.notify(msg, err);
+        }
+        self.handle_dropped_files(ctx);
+        // F11 toggles fullscreen everywhere (but not while a key is being
+        // bound in Settings). The window's real state wins, in case the
+        // system changed it.
+        let (f11, real_fs) = ctx.input(|i| (i.key_pressed(Key::F11), i.viewport().fullscreen));
+        if let Some(fs) = real_fs {
+            self.fullscreen = fs;
+        }
+        if f11 && self.rebinding.is_none() {
+            self.toggle_fullscreen(ctx);
+        }
+        if let Some(g) = self.autostart.take() {
+            self.start_game(g);
+        }
+        let title = match (&self.screen, &self.emu) {
+            (Screen::Playing, Some(e)) => format!("Digimon Worlds Re:Compiled – {}", e.game.title()),
+            _ => "Digimon Worlds Re:Compiled".to_string(),
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        match self.screen {
+            Screen::Login => self.login_screen(ctx),
+            Screen::Library => self.library_screen(ctx),
+            Screen::Settings => self.settings_screen(ctx),
+            Screen::Mods => self.mods_screen(ctx),
+            Screen::Playing => self.playing_screen(ctx),
+        }
+        if self.screen != Screen::Playing && self.screen != Screen::Login {
+            if let Some(m) = self.updater.window(ctx) {
+                self.notify(m, true);
+            }
+        }
+        self.overlays(ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.stop_game();
+        self.save_cfg();
+    }
+}
+
+fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::default().fill(CARD_BG).corner_radius(8.0).inner_margin(14.0).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(title).size(16.0).strong().color(BLUE));
+        ui.add_space(4.0);
+        add(ui);
+    });
+    ui.add_space(12.0);
+}
+
+fn pretty_button(b: Button) -> &'static str {
+    match b {
+        Button::Up => "D-pad Up",
+        Button::Down => "D-pad Down",
+        Button::Left => "D-pad Left",
+        Button::Right => "D-pad Right",
+        Button::Cross => "Cross",
+        Button::Circle => "Circle",
+        Button::Square => "Square",
+        Button::Triangle => "Triangle",
+        Button::Start => "Start",
+        Button::Select => "Select",
+        Button::L1 => "L1",
+        Button::R1 => "R1",
+        Button::L2 => "L2",
+        Button::R2 => "R2",
+        Button::L3 => "L3",
+        Button::R3 => "R3",
+    }
+}
+
+fn style(ctx: &egui::Context) {
+    // Always dark. egui otherwise follows the system theme, and with a light
+    // Windows/macOS theme it drew dark text and light buttons on our dark
+    // panels.
+    ctx.set_theme(egui::ThemePreference::Dark);
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = PANEL_BG;
+    v.window_fill = Color32::from_rgb(24, 27, 33);
+    v.selection.bg_fill = ACCENT_DIM;
+    v.selection.stroke = Stroke::new(1.0_f32, ACCENT);
+    v.hyperlink_color = BLUE;
+    v.extreme_bg_color = Color32::from_rgb(30, 34, 42);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    ctx.set_visuals_of(egui::Theme::Light, v.clone());
+    ctx.set_visuals_of(egui::Theme::Dark, v);
+    ctx.all_styles_mut(|s| {
+        s.spacing.button_padding = Vec2::new(10.0, 5.0);
+        s.spacing.item_spacing = Vec2::new(8.0, 7.0);
+    });
+}
+
+pub(crate) fn open_folder(p: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer").arg(p).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(p).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(p).spawn();
+}
+
+/// The "sped up" badge shown while a mod runs the game faster: two
+/// triangles and the factor, right-aligned at `at`.
+/// How long a message stays over the game picture.
+const OSD_TIME: Duration = Duration::from_millis(2500);
+
+/// A short message over the game picture, fading out at the end.
+fn osd_message(p: &egui::Painter, at: egui::Pos2, msg: &str, age: Duration) {
+    let left = OSD_TIME.saturating_sub(age).as_secs_f32();
+    let a = (left / 0.4).clamp(0.0, 1.0);
+    let fg = Color32::from_rgba_unmultiplied(255, 255, 255, (235.0 * a) as u8);
+    let text = p.layout_no_wrap(msg.to_string(), egui::FontId::proportional(17.0), fg);
+    let rect = egui::Rect::from_min_size(at, text.size() + Vec2::new(20.0, 10.0));
+    p.rect_filled(rect, 6.0, Color32::from_rgba_unmultiplied(0, 0, 0, (160.0 * a) as u8));
+    p.galley(rect.min + Vec2::new(10.0, 5.0), text, fg);
+}
+
+fn fast_forward_badge(p: &egui::Painter, at: egui::Pos2, speed: u32) {
+    let fg = Color32::from_rgba_unmultiplied(255, 255, 255, 230);
+    let font = egui::FontId::proportional(18.0);
+    let text = p.layout_no_wrap(format!("{speed}x"), font, fg);
+    let (tri_w, h) = (10.0, 14.0);
+    let w = 6.0 + tri_w * 2.0 + 6.0 + text.size().x + 8.0;
+    let rect = egui::Rect::from_min_size(egui::pos2(at.x - w, at.y), Vec2::new(w, 26.0));
+    p.rect_filled(rect, 6.0, Color32::from_rgba_unmultiplied(0, 0, 0, 150));
+    let cy = rect.center().y;
+    for i in 0..2 {
+        let x = rect.left() + 6.0 + i as f32 * tri_w;
+        p.add(egui::Shape::convex_polygon(
+            vec![egui::pos2(x, cy - h / 2.0), egui::pos2(x + tri_w, cy), egui::pos2(x, cy + h / 2.0)],
+            fg,
+            egui::Stroke::NONE,
+        ));
+    }
+    p.galley(egui::pos2(rect.left() + 6.0 + tri_w * 2.0 + 6.0, cy - text.size().y / 2.0), text, fg);
+}
+
+pub fn save_png(path: &std::path::Path, w: u32, h: u32, argb: &[u32]) -> anyhow::Result<()> {
+    let f = std::fs::File::create(path)?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w, h);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut wr = enc.write_header()?;
+    let mut data = Vec::with_capacity((w * h * 3) as usize);
+    for p in argb {
+        data.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8]);
+    }
+    wr.write_image_data(&data)?;
+    Ok(())
+}
+
+fn load_png(path: &std::path::Path) -> Option<(u32, u32, Vec<u8>)> {
+    let f = std::fs::File::open(path).ok()?;
+    let dec = png::Decoder::new(std::io::BufReader::new(f));
+    let mut r = dec.read_info().ok()?;
+    let mut buf = vec![0; r.output_buffer_size()];
+    let info = r.next_frame(&mut buf).ok()?;
+    let (w, h) = (info.width, info.height);
+    let rgba = match info.color_type {
+        png::ColorType::Rgb => buf[..(w * h * 3) as usize].chunks(3).flat_map(|c| [c[0], c[1], c[2], 255]).collect(),
+        png::ColorType::Rgba => buf[..(w * h * 4) as usize].to_vec(),
+        _ => return None,
+    };
+    Some((w, h, rgba))
+}
+
+impl App {
+    fn login_screen(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("login_top")
+            .frame(egui::Frame::default().fill(PANEL_BG).inner_margin(egui::Margin::symmetric(18, 12)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("DIGIMON WORLD 1").size(22.0).strong().color(Color32::WHITE));
+                    ui.label(RichText::new("MMO Client").size(22.0).strong().color(ACCENT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let close = egui::Button::new(RichText::new("Close").size(16.0).strong().color(MUTED))
+                            .fill(Color32::TRANSPARENT)
+                            .min_size(Vec2::new(96.0, 30.0));
+                        if ui.add(close).clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+                });
+            });
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(Color32::from_rgb(13, 14, 18)).inner_margin(24.0))
+            .show(ctx, |ui| {
+                let avail = ui.available_rect_before_wrap();
+                let box_w = 420.0_f32.min(avail.width() - 32.0).max(280.0);
+                let inner_w = box_w - 48.0;
+                let box_h = 380.0;
+                let center_rect = egui::Rect::from_center_size(
+                    egui::pos2(avail.center().x, avail.top() + (avail.height() / 2.0).max(box_h / 2.0 + 16.0)),
+                    egui::vec2(box_w, box_h),
+                );
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(center_rect), |ui| {
+                    egui::Frame::default()
+                        .fill(CARD_BG)
+                        .corner_radius(12.0)
+                        .inner_margin(24.0)
+                        .stroke(Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(64, 156, 255, 110)))
+                        .show(ui, |ui| {
+                            ui.set_min_width(inner_w);
+                            ui.set_max_width(inner_w);
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new("Tamer Account Login").size(22.0).strong().color(Color32::WHITE));
+                                ui.label(RichText::new("SLUS-01032 · File Island Dedicated Server").size(13.0).color(MUTED));
+                                ui.add_space(16.0);
+
+                                ui.label(RichText::new("Server IP / Host (WS :8080 · UDP :7777)").size(13.0).color(MUTED));
+                                ui.add(egui::TextEdit::singleline(&mut self.login_host).desired_width(f32::INFINITY));
+                                ui.add_space(10.0);
+
+                                ui.label(RichText::new("Username").size(13.0).color(MUTED));
+                                ui.add(egui::TextEdit::singleline(&mut self.login_user).desired_width(f32::INFINITY));
+                                ui.add_space(10.0);
+
+                                ui.label(RichText::new("Password").size(13.0).color(MUTED));
+                                let pass_resp = ui.add(
+                                    egui::TextEdit::singleline(&mut self.login_pass)
+                                        .password(true)
+                                        .desired_width(f32::INFINITY),
+                                );
+                                let enter_pressed = pass_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+
+                                if let Some(err) = &self.login_error {
+                                    ui.add_space(10.0);
+                                    ui.label(RichText::new(err).size(12.5).color(BAD));
+                                }
+
+                                ui.add_space(18.0);
+                                let login_btn = ui.add(
+                                    egui::Button::new(RichText::new("LOGIN TO SERVER").size(15.5).strong().color(Color32::BLACK))
+                                        .fill(ACCENT)
+                                        .min_size(Vec2::new(inner_w, 38.0)),
+                                );
+                                if login_btn.clicked() || enter_pressed {
+                                    match dwrc_net::authenticate_ws(&self.login_host, &self.login_user, &self.login_pass) {
+                                        Ok(sess) => {
+                                            self.login_error = None;
+                                            self.notify(format!("Login berhasil sebagai Tamer {}!", sess.tamer_name), false);
+                                            self.mmo_session = sess;
+                                            self.screen = Screen::Library;
+                                        }
+                                        Err(e) => {
+                                            self.login_error = Some(e);
+                                        }
+                                    }
+                                }
+
+                                ui.add_space(8.0);
+                                let offline_btn = ui.add(
+                                    egui::Button::new(RichText::new("Play Offline / Local Mode").size(13.5).color(MUTED))
+                                        .fill(Color32::from_rgb(22, 25, 32))
+                                        .min_size(Vec2::new(inner_w, 32.0)),
+                                );
+                                if offline_btn.clicked() {
+                                    self.login_error = None;
+                                    let tname = if self.login_user.trim().is_empty() {
+                                        "Adi".to_string()
+                                    } else {
+                                        self.login_user.trim().to_string()
+                                    };
+                                    self.mmo_session = dwrc_net::AccountSession {
+                                        server_host: self.login_host.trim().to_string(),
+                                        username: tname.clone(),
+                                        tamer_id: 1,
+                                        tamer_name: tname,
+                                        bits: 500,
+                                        prosperity: 1,
+                                        is_online: false,
+                                    };
+                                    self.screen = Screen::Library;
+                                }
+                            });
+                        });
+                });
+            });
+    }
+}
+
+fn draw_ingame_map_layout(
+    p: &egui::Painter,
+    at_right_top: egui::Pos2,
+    tf: &dwrc_net::PlayerTransform,
+    area_name: &str,
+    is_online: bool,
+    udp_ok: bool,
+) {
+    let panel_w = 246.0;
+    let map_h = 176.0;
+    let info_h = 84.0;
+    let total_h = map_h + info_h + 16.0;
+    let rect = egui::Rect::from_min_size(egui::pos2(at_right_top.x - panel_w, at_right_top.y), Vec2::new(panel_w, total_h));
+
+    // Background & border panel Map Layout
+    p.rect_filled(rect, 8.0, Color32::from_rgba_unmultiplied(10, 15, 24, 195));
+    p.rect_stroke(rect, 8.0, Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(64, 156, 255, 150)), egui::StrokeKind::Inside);
+
+    // Header nama Map & status sync
+    let sync_txt = if !is_online { "LOCAL" } else if udp_ok { "UDP 7777" } else { "SYNC..." };
+    let sync_col = if !is_online { WARN } else if udp_ok { OK } else { BAD };
+    p.text(
+        rect.min + Vec2::new(10.0, 8.0),
+        Align2::LEFT_TOP,
+        area_name,
+        egui::FontId::proportional(13.5),
+        Color32::WHITE,
+    );
+    p.text(
+        egui::pos2(rect.right() - 10.0, rect.top() + 9.0),
+        Align2::RIGHT_TOP,
+        sync_txt,
+        egui::FontId::monospace(11.0),
+        sync_col,
+    );
+
+    // Area Kanvas Map Layout 2D
+    let map_rect = egui::Rect::from_min_size(rect.min + Vec2::new(10.0, 30.0), Vec2::new(panel_w - 20.0, map_h));
+    p.rect_filled(map_rect, 6.0, Color32::from_rgb(16, 22, 32));
+    p.rect_stroke(map_rect, 6.0, Stroke::new(1.0_f32, Color32::from_rgb(38, 52, 72)), egui::StrokeKind::Inside);
+
+    // Grid tata letak ruangan/area (skala 1 kotak = 1000 unit PS1)
+    let center = map_rect.center();
+    let scale = (map_rect.width() * 0.44) / 4500.0;
+    for i in -3..=3 {
+        let off = i as f32 * 1000.0 * scale;
+        let gx = center.x + off;
+        let gy = center.y + off;
+        if gx > map_rect.left() && gx < map_rect.right() {
+            p.line_segment(
+                [egui::pos2(gx, map_rect.top()), egui::pos2(gx, map_rect.bottom())],
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(45, 62, 85, 90)),
+            );
+        }
+        if gy > map_rect.top() && gy < map_rect.bottom() {
+            p.line_segment(
+                [egui::pos2(map_rect.left(), gy), egui::pos2(map_rect.right(), gy)],
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(45, 62, 85, 90)),
+            );
+        }
+    }
+    // Crosshair titik pusat map (0,0)
+    p.line_segment(
+        [egui::pos2(center.x - 5.0, center.y), egui::pos2(center.x + 5.0, center.y)],
+        Stroke::new(1.0_f32, Color32::from_rgb(80, 105, 135)),
+    );
+    p.line_segment(
+        [egui::pos2(center.x, center.y - 5.0), egui::pos2(center.x, center.y + 5.0)],
+        Stroke::new(1.0_f32, Color32::from_rgb(80, 105, 135)),
+    );
+
+    // Proyeksi koordinat PS1 (X, Z) ke kanvas 2D (di-clamp agar selalu terlihat di dalam batas map)
+    let to_canvas = |wx: i32, wz: i32| -> egui::Pos2 {
+        let px = (center.x + (wx as f32) * scale).clamp(map_rect.left() + 8.0, map_rect.right() - 8.0);
+        let py = (center.y + (wz as f32) * scale).clamp(map_rect.top() + 8.0, map_rect.bottom() - 8.0);
+        egui::pos2(px, py)
+    };
+
+    let tamer_pos = to_canvas(tf.x, tf.z);
+    let partner_pos = to_canvas(tf.digimon_x, tf.digimon_z);
+
+    // Garis penghubung Tamer <-> Partner
+    p.line_segment(
+        [tamer_pos, partner_pos],
+        Stroke::new(1.2_f32, Color32::from_rgba_unmultiplied(255, 180, 60, 140)),
+    );
+
+    // Marker Partner Digimon (Oranye/Emas)
+    p.circle_filled(partner_pos, 4.5, ACCENT);
+    p.circle_stroke(partner_pos, 5.5, Stroke::new(1.0_f32, Color32::WHITE));
+    p.text(
+        partner_pos + Vec2::new(6.0, -6.0),
+        Align2::LEFT_CENTER,
+        format!("Partner #{}", tf.digimon_id),
+        egui::FontId::monospace(10.0),
+        ACCENT,
+    );
+
+    // Marker Player / Tamer (Cyan + arah hadap Yaw PS1 0..4096)
+    let angle = (tf.yaw as f32) * (std::f32::consts::TAU / 4096.0);
+    let dir_tip = tamer_pos + Vec2::new(angle.sin() * 11.0, angle.cos() * 11.0);
+    p.line_segment([tamer_pos, dir_tip], Stroke::new(2.0_f32, Color32::WHITE));
+    p.circle_filled(tamer_pos, 5.0, BLUE);
+    p.circle_stroke(tamer_pos, 6.0, Stroke::new(1.2_f32, Color32::WHITE));
+    p.text(
+        tamer_pos + Vec2::new(6.0, 6.0),
+        Align2::LEFT_CENTER,
+        &tf.tamer_name,
+        egui::FontId::monospace(10.5),
+        Color32::from_rgb(150, 220, 255),
+    );
+
+    // Detail telemetri koordinat di bawah kanvas map
+    let info_top = map_rect.bottom() + 6.0;
+    let mono = egui::FontId::monospace(11.5);
+    p.text(
+        egui::pos2(rect.left() + 10.0, info_top),
+        Align2::LEFT_TOP,
+        format!("Tamer  : X={} Y={} Z={}", tf.x, tf.y, tf.z),
+        mono.clone(),
+        Color32::from_rgb(170, 225, 255),
+    );
+    p.text(
+        egui::pos2(rect.left() + 10.0, info_top + 16.0),
+        Align2::LEFT_TOP,
+        format!("Partner: X={} Z={} (ID {})", tf.digimon_x, tf.digimon_z, tf.digimon_id),
+        mono.clone(),
+        Color32::from_rgb(255, 200, 130),
+    );
+    p.text(
+        egui::pos2(rect.left() + 10.0, info_top + 32.0),
+        Align2::LEFT_TOP,
+        format!("Yaw: {} | Anim T/P: {}/{}", tf.yaw, tf.anim_id, tf.digimon_anim),
+        mono,
+        MUTED,
+    );
+}
