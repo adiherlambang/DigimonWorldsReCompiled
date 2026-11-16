@@ -83,6 +83,9 @@ pub struct App {
     mmo_session: dwrc_net::AccountSession,
     /// Memegang koneksi WebSocket selama online (sesi berakhir bila ini di-drop).
     mmo_net: Option<dwrc_net::client::NetClient>,
+    /// Mengunggah memory card ke server selama bermain online (hanya Digimon World 1).
+    card_uploader: Option<dwrc_net::cardsync::CardUploader>,
+    card_conflict_shown: bool,
     login_register: bool,
     login_tamer: String,
 }
@@ -133,6 +136,8 @@ impl App {
             cfg,
             screen: Screen::Login,
             emu: None,
+            card_uploader: None,
+            card_conflict_shown: false,
             audio,
             _audio_out: audio_out,
             audio_error,
@@ -175,6 +180,7 @@ impl App {
             return;
         }
         self.stop_game();
+        self.sync_cards_before_start(g);
         let serial = self.lib.games[&g].ident.serial.clone();
         let mods = dwrc_runtime::enabled_mods(&self.paths, &self.cfg, g, &serial);
         let emu = EmuHandle::start(self.paths.clone(), self.lib.clone(), self.cfg.clone(), g, mods, self.audio.clone());
@@ -187,8 +193,37 @@ impl App {
         self.screen = Screen::Playing;
     }
 
+    /// Bermain online di Digimon World 1: samakan memory card dengan server SEBELUM game
+    /// membacanya, lalu pantau perubahan selama bermain. Save lokal yang akan ditimpa
+    /// selalu dicadangkan dulu (folder `backups` di samping kartu).
+    fn sync_cards_before_start(&mut self, g: GameId) {
+        use dwrc_net::cardsync::{sync_on_login, CardIdentity, CardServer, CardUploader};
+        self.card_conflict_shown = false;
+        if g != GameId::Dw1 || !self.mmo_session.is_online {
+            return;
+        }
+        let Some(net) = self.mmo_net.as_ref().map(|n| n.shared.clone()) else { return };
+        let dir = self.paths.saves_dir(g);
+        let id = CardIdentity { server: self.mmo_session.server_host.clone(), tamer_id: self.mmo_session.tamer_id };
+        let slots: Vec<u8> = if self.cfg.emulation.memory_card_2 { vec![1, 2] } else { vec![1] };
+        match sync_on_login(&*net, &dir, &id, &slots) {
+            Ok(out) => {
+                for line in &out.lines {
+                    self.notify(line.clone(), false);
+                }
+                self.card_uploader = Some(CardUploader::start(net as std::sync::Arc<dyn CardServer>, dir, id, out.known));
+            }
+            Err(e) => self.notify(format!("Sinkron save online gagal ({e}). Game memakai save lokal dan tidak mengunggah."), true),
+        }
+    }
+
     /// Server mengakhiri sesi (mis. login dari tempat lain): kembali ke mode lokal.
     fn check_net_session(&mut self) {
+        if !self.card_conflict_shown && self.card_uploader.as_ref().is_some_and(|u| u.status.conflict.load(std::sync::atomic::Ordering::Relaxed)) {
+            self.card_conflict_shown = true;
+            let msg = self.card_uploader.as_ref().map(|u| u.status.text()).unwrap_or_default();
+            self.notify(msg, true);
+        }
         let Some(reason) = self.mmo_session.net.as_ref().and_then(|n| n.end_reason()) else { return };
         self.mmo_session.is_online = false;
         self.mmo_session.net = None;
@@ -215,8 +250,17 @@ impl App {
                     let _ = save_png(&dir.join("thumbnail.png"), keep.min(f.width), f.height, &px);
                 }
             }
-            emu.stop();
+            emu.stop(); // menulis memory card terakhir ke disk
             self.thumbs.remove(&g);
+        }
+        // Unggahan terakhir sesudah game berhenti, supaya save terakhir ikut tersimpan online.
+        if let Some(up) = self.card_uploader.take() {
+            let status = up.status.clone();
+            up.stop();
+            let t = status.text();
+            if !t.is_empty() {
+                self.notify(t, status.conflict.load(std::sync::atomic::Ordering::Relaxed));
+            }
         }
         self.audio.clear();
     }
@@ -1115,6 +1159,7 @@ impl App {
                 e.send(EmuCmd::Click { right, u, v });
             }
         }
+        let card_status = self.card_uploader.as_ref().map(|u| u.status.text()).filter(|t| !t.is_empty());
         if self.show_pause {
             let mut quit = false;
             let mut reset = false;
@@ -1126,6 +1171,9 @@ impl App {
                     ui.set_min_width(260.0);
                     ui.label(RichText::new(&status.title).strong());
                     ui.label(RichText::new(format!("Engine: {} · BIOS: {}", status.engine, status.bios)).color(MUTED).small());
+                    if let Some(t) = &card_status {
+                        ui.label(RichText::new(t).color(MUTED).small());
+                    }
                     if !status.mod_log.is_empty() {
                         egui::CollapsingHeader::new("Mod log").default_open(false).show(ui, |ui| {
                             for l in &status.mod_log {
