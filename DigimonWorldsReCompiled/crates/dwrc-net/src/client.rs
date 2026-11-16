@@ -5,10 +5,12 @@
 //! event (roster/join/leave/session_end) ke `NetShared`.
 
 use crate::proto::DEFAULT_UDP_PORT;
-use crate::state::NetShared;
+use crate::state::{NetShared, Outgoing};
 use crate::AccountSession;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -101,10 +103,14 @@ fn connect_auth(host: &str, request: Value) -> Result<(AccountSession, NetClient
     // Setelah handshake, baca dengan timeout pendek supaya thread bisa dihentikan.
     let _ = ws.get_ref().set_read_timeout(Some(Duration::from_millis(100)));
     let stop = Arc::new(AtomicBool::new(false));
+    let (out_tx, out_rx) = mpsc::channel::<Outgoing>();
+    if let Ok(mut g) = shared.outbox.lock() {
+        *g = Some(out_tx);
+    }
     let (sh, st) = (shared.clone(), stop.clone());
     let thread = std::thread::Builder::new()
         .name("mmo-ws".into())
-        .spawn(move || run(ws, sh, st))
+        .spawn(move || run(ws, sh, st, out_rx))
         .map_err(|e| format!("Gagal memulai thread jaringan: {e}"))?;
 
     Ok((session, NetClient { shared, stop, thread: Some(thread) }))
@@ -114,11 +120,36 @@ fn is_timeout(e: &std::io::Error) -> bool {
     matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
 }
 
-fn run(mut ws: WebSocket<TcpStream>, shared: Arc<NetShared>, stop: Arc<AtomicBool>) {
+fn run(mut ws: WebSocket<TcpStream>, shared: Arc<NetShared>, stop: Arc<AtomicBool>, outbox: mpsc::Receiver<Outgoing>) {
     shared.connected.store(true, Ordering::Relaxed);
+    // reqId -> pengirim permintaan yang menunggu balasan.
+    let mut pending: HashMap<u64, mpsc::Sender<Value>> = HashMap::new();
     while !stop.load(Ordering::Relaxed) {
+        while let Ok(req) = outbox.try_recv() {
+            pending.insert(req.req_id, req.reply);
+            match ws.send(Message::Text(req.text.into())) {
+                Ok(()) => {}
+                Err(WsError::Io(e)) if is_timeout(&e) => {} // tertunda; flush di bawah melanjutkan
+                Err(e) => {
+                    pending.remove(&req.req_id); // pemanggil melihat koneksi terputus
+                    shared.set_ended(&format!("Koneksi ke server terputus: {e}"));
+                }
+            }
+        }
         match ws.read() {
-            Ok(Message::Text(t)) => shared.apply_event(&t.to_string()),
+            Ok(Message::Text(t)) => {
+                let text = t.to_string();
+                let routed = serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .and_then(|v| v["reqId"].as_u64().map(|id| (id, v)))
+                    .and_then(|(id, v)| pending.remove(&id).map(|tx| (tx, v)));
+                match routed {
+                    Some((tx, v)) => {
+                        let _ = tx.send(v);
+                    }
+                    None => shared.apply_event(&text),
+                }
+            }
             Ok(Message::Close(_)) => {
                 shared.set_ended("Server menutup koneksi.");
                 break;
@@ -143,5 +174,8 @@ fn run(mut ws: WebSocket<TcpStream>, shared: Arc<NetShared>, stop: Arc<AtomicBoo
     }
     let _ = ws.close(None);
     let _ = ws.flush();
+    if let Ok(mut g) = shared.outbox.lock() {
+        *g = None;
+    }
     shared.connected.store(false, Ordering::Relaxed);
 }

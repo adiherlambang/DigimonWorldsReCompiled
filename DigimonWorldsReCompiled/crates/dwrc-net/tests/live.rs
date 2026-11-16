@@ -105,3 +105,66 @@ fn rust_client_vs_node_server() {
     let again = NetClient::login(&h, &ub, "secret-pass-2").expect("login B setelah disconnect");
     assert_eq!(again.0.tamer_id, sb.tamer_id);
 }
+
+fn blank_card(game: bool, marker: u8) -> Vec<u8> {
+    let xor = |b: &[u8]| b.iter().fold(0u8, |a, x| a ^ x);
+    let mut b = vec![0u8; 128 * 1024];
+    b[0] = b'M';
+    b[1] = b'C';
+    b[127] = xor(&b[..127]);
+    for i in 1..16 {
+        b[i * 128] = 0xA0;
+        b[i * 128 + 127] = xor(&b[i * 128..i * 128 + 127]);
+    }
+    if game {
+        b[128] = 0x51;
+        b[138..157].copy_from_slice(b"BASLUS-01032DIGIMON");
+        b[128 + 127] = xor(&b[128..255]);
+    }
+    b[8192] = marker;
+    b
+}
+
+/// Sinkronisasi memory card lewat WebSocket asli: komputer A mengunggah, komputer B menarik,
+/// B menyimpan lagi (diunggah `CardUploader`), A menarik versi baru tanpa konflik.
+#[test]
+#[ignore]
+fn card_sync_vs_node_server() {
+    use dwrc_net::cardsync::{card_path, sync_on_login, CardIdentity, CardServer, CardUploader};
+    use std::sync::Arc;
+
+    let h = host();
+    let u = uniq();
+    let (sess, client) = NetClient::register(&h, &format!("cs_{u}"), "secret-pass-1", &format!("CS{}", &u[..4])).expect("register");
+    let net = client.shared.clone();
+    let id = CardIdentity { server: h.clone(), tamer_id: sess.tamer_id };
+    let base = std::env::temp_dir().join(format!("dwrc-live-{u}"));
+    let (dir_a, dir_b) = (base.join("a"), base.join("b"));
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    // A: kartu lokal berisi, server masih kosong -> diunggah sebagai versi 1.
+    let v1 = blank_card(true, 1);
+    std::fs::write(card_path(&dir_a, 1), &v1).unwrap();
+    let out_a = sync_on_login(&*net, &dir_a, &id, &[1, 2]).expect("sync A");
+    assert!(out_a.lines[0].contains("diunggah"), "{:?}", out_a.lines);
+    assert_eq!(net.list().unwrap()[0].version, 1);
+
+    // B: komputer lain tanpa kartu -> menarik v1.
+    let out_b = sync_on_login(&*net, &dir_b, &id, &[1, 2]).expect("sync B");
+    assert!(out_b.pulled);
+    assert_eq!(std::fs::read(card_path(&dir_b, 1)).unwrap(), v1);
+
+    // B bermain dan menyimpan; CardUploader mengunggah saat berhenti.
+    let v2 = blank_card(true, 2);
+    let up = CardUploader::start(net.clone() as Arc<dyn CardServer>, dir_b.clone(), id.clone(), out_b.known);
+    std::fs::write(card_path(&dir_b, 1), &v2).unwrap();
+    up.stop();
+    assert_eq!(net.list().unwrap()[0].version, 2, "unggahan terakhir saat berhenti");
+
+    // A login lagi: kartunya tidak disentuh -> menarik v2, bukan konflik.
+    let out_a2 = sync_on_login(&*net, &dir_a, &id, &[1, 2]).expect("sync A lagi");
+    assert_eq!(std::fs::read(card_path(&dir_a, 1)).unwrap(), v2);
+    assert!(!out_a2.lines[0].contains("berbeda dari server"), "{:?}", out_a2.lines);
+    let _ = std::fs::remove_dir_all(&base);
+}

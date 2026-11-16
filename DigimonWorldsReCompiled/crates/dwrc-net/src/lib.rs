@@ -1,3 +1,4 @@
+pub mod cardsync;
 pub mod client;
 pub mod dw1_ram;
 pub mod proto;

@@ -3,8 +3,8 @@
 use crate::proto::RemotePlayer;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 
 /// Pemain lain di map yang sama, dari event WebSocket.
@@ -14,8 +14,19 @@ pub struct PeerInfo {
     pub species: u16,
 }
 
+/// Satu permintaan WebSocket yang menunggu balasan dengan `reqId` yang sama.
+#[derive(Debug)]
+pub struct Outgoing {
+    pub req_id: u64,
+    pub text: String,
+    pub reply: mpsc::Sender<Value>,
+}
+
 #[derive(Debug, Default)]
 pub struct NetShared {
+    /// Antrean permintaan ke thread WebSocket (diisi saat koneksi terbentuk).
+    pub outbox: Mutex<Option<mpsc::Sender<Outgoing>>>,
+    next_req: AtomicU64,
     /// WebSocket masih tersambung.
     pub connected: AtomicBool,
     /// Alasan sesi berakhir (mis. login dari tempat lain). `None` = masih hidup.
@@ -27,6 +38,26 @@ pub struct NetShared {
 }
 
 impl NetShared {
+    /// Kirim satu pesan dan tunggu balasan yang membawa `reqId` yang sama.
+    /// Dipanggil dari thread mana pun; WebSocket tetap hanya dipegang thread jaringan.
+    pub fn request(&self, mut msg: Value, timeout: Duration) -> Result<Value, String> {
+        let req_id = self.next_req.fetch_add(1, Ordering::Relaxed) + 1;
+        msg["reqId"] = Value::from(req_id);
+        let tx = self
+            .outbox
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .ok_or_else(|| "Tidak terhubung ke server.".to_string())?;
+        let (reply, rx) = mpsc::channel();
+        tx.send(Outgoing { req_id, text: msg.to_string(), reply })
+            .map_err(|_| "Koneksi ke server terputus.".to_string())?;
+        rx.recv_timeout(timeout).map_err(|e| match e {
+            mpsc::RecvTimeoutError::Timeout => "Server tidak membalas (waktu habis).".to_string(),
+            mpsc::RecvTimeoutError::Disconnected => "Koneksi ke server terputus.".to_string(),
+        })
+    }
+
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
