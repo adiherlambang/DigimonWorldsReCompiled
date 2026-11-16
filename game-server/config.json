@@ -1,14 +1,7 @@
 {
-  "udpPort": 7777,
+  "host": "0.0.0.0",
   "wsPort": 8080,
-  "sql": {
-    "user": "sa",
-    "password": "YourSqlPasswordHere",
-    "server": "localhost",
-    "database": "DW1_MMO",
-    "options": {
-      "encrypt": false,
-      "trustServerCertificate": true
-    }
-  }
+  "udpPort": 7777,
+  "bcryptCost": 12,
+  "maxPlayers": 200
 }

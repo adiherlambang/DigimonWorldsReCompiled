@@ -1,15 +1,20 @@
-﻿# Rust (DigimonWorldsReCompiled target & cache)
-/upstream/DigimonWorldsReCompiled/target/
+# Rust build output & cache
+/DigimonWorldsReCompiled/target/
 **/.cargo-lock
 **/.rustc_info.json
 
-# Node.js (game-server modules)
+# Node.js (game-server)
 /game-server/node_modules/
 npm-debug.log*
 yarn-debug.log*
 
-# Database temporary / logs
+# Database runtime (jangan commit data pemain / hash password)
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 *.sqlite-journal
+
+# Misc
 *.log
 .DS_Store
 Thumbs.db

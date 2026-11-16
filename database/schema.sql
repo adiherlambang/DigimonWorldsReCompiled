@@ -1,85 +1,73 @@
-IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = N'DW1_MMO')
-BEGIN
-    CREATE DATABASE DW1_MMO;
-END
-GO
+-- DW1 MMO schema (SQLite). Dijalankan otomatis oleh game-server saat start.
+-- Semua statement idempotent (IF NOT EXISTS).
 
-USE DW1_MMO;
-GO
-
-IF OBJECT_ID('Accounts', 'U') IS NULL
-CREATE TABLE Accounts (
-    AccountID INT IDENTITY(1,1) PRIMARY KEY,
-    Username VARCHAR(32) NOT NULL UNIQUE,
-    PasswordHash VARCHAR(255) NOT NULL,
-    CreatedAt DATETIME2 DEFAULT GETDATE(),
-    LastLogin DATETIME2 NULL
+CREATE TABLE IF NOT EXISTS Accounts (
+    AccountID    INTEGER PRIMARY KEY AUTOINCREMENT,
+    Username     TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    PasswordHash TEXT NOT NULL,
+    CreatedAt    TEXT DEFAULT CURRENT_TIMESTAMP,
+    LastLogin    TEXT
 );
 
-IF OBJECT_ID('Tamers', 'U') IS NULL
-CREATE TABLE Tamers (
-    TamerID INT IDENTITY(1,1) PRIMARY KEY,
-    AccountID INT NOT NULL FOREIGN KEY REFERENCES Accounts(AccountID),
-    TamerName VARCHAR(16) NOT NULL UNIQUE,
-    Bits INT NOT NULL DEFAULT 500,
-    ProsperityPoints INT NOT NULL DEFAULT 1,
-    MentorPoints INT NOT NULL DEFAULT 0,
-    CurrentMapID INT NOT NULL DEFAULT 2,
-    PosX INT NOT NULL DEFAULT 0,
-    PosY INT NOT NULL DEFAULT 0,
-    PosZ INT NOT NULL DEFAULT 0,
-    IsOnline BIT NOT NULL DEFAULT 0
+CREATE TABLE IF NOT EXISTS Tamers (
+    TamerID          INTEGER PRIMARY KEY AUTOINCREMENT,
+    AccountID        INTEGER NOT NULL REFERENCES Accounts(AccountID),
+    TamerName        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    Bits             INTEGER NOT NULL DEFAULT 500,
+    ProsperityPoints INTEGER NOT NULL DEFAULT 1,
+    MentorPoints     INTEGER NOT NULL DEFAULT 0,
+    CurrentMapID     INTEGER NOT NULL DEFAULT 2,
+    PosX             INTEGER NOT NULL DEFAULT 0,
+    PosY             INTEGER NOT NULL DEFAULT 0,
+    PosZ             INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS IX_Tamers_Account ON Tamers(AccountID);
+
+CREATE TABLE IF NOT EXISTS ActiveDigimon (
+    DigimonInstanceID INTEGER PRIMARY KEY AUTOINCREMENT,
+    TamerID      INTEGER NOT NULL REFERENCES Tamers(TamerID),
+    SpeciesID    INTEGER NOT NULL DEFAULT 3,
+    Nickname     TEXT,
+    CurrentHP    INTEGER NOT NULL DEFAULT 100,
+    MaxHP        INTEGER NOT NULL DEFAULT 100,
+    CurrentMP    INTEGER NOT NULL DEFAULT 100,
+    MaxMP        INTEGER NOT NULL DEFAULT 100,
+    Offense      INTEGER NOT NULL DEFAULT 10,
+    Defense      INTEGER NOT NULL DEFAULT 10,
+    Speed        INTEGER NOT NULL DEFAULT 10,
+    Brains       INTEGER NOT NULL DEFAULT 10,
+    Discipline   INTEGER NOT NULL DEFAULT 50,
+    Happiness    INTEGER NOT NULL DEFAULT 50,
+    CareMistakes INTEGER NOT NULL DEFAULT 0,
+    AgeDays      INTEGER NOT NULL DEFAULT 0,
+    Weight       INTEGER NOT NULL DEFAULT 15,
+    UpdatedAt    TEXT
+);
+CREATE INDEX IF NOT EXISTS IX_ActiveDigimon_Tamer ON ActiveDigimon(TamerID);
+
+CREATE TABLE IF NOT EXISTS TamerInventory (
+    InventoryID INTEGER PRIMARY KEY AUTOINCREMENT,
+    TamerID     INTEGER NOT NULL REFERENCES Tamers(TamerID),
+    ItemType    TEXT NOT NULL,
+    ItemID      INTEGER NOT NULL,
+    Quantity    INTEGER NOT NULL DEFAULT 1,
+    IsTradeable INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(TamerID, ItemType, ItemID)
 );
 
-IF OBJECT_ID('ActiveDigimon', 'U') IS NULL
-CREATE TABLE ActiveDigimon (
-    DigimonInstanceID INT IDENTITY(1,1) PRIMARY KEY,
-    TamerID INT NOT NULL FOREIGN KEY REFERENCES Tamers(TamerID),
-    SpeciesID INT NOT NULL DEFAULT 3,
-    Nickname VARCHAR(16) NULL,
-    CurrentHP INT NOT NULL DEFAULT 100,
-    MaxHP INT NOT NULL DEFAULT 100,
-    CurrentMP INT NOT NULL DEFAULT 100,
-    MaxMP INT NOT NULL DEFAULT 100,
-    Offense INT NOT NULL DEFAULT 10,
-    Defense INT NOT NULL DEFAULT 10,
-    Speed INT NOT NULL DEFAULT 10,
-    Brains INT NOT NULL DEFAULT 10,
-    Discipline INT NOT NULL DEFAULT 50,
-    Happiness INT NOT NULL DEFAULT 50,
-    CareMistakes INT NOT NULL DEFAULT 0,
-    AgeDays INT NOT NULL DEFAULT 0,
-    Weight INT NOT NULL DEFAULT 15,
-    UpdatedAt DATETIME2 DEFAULT GETDATE()
-);
-
-IF OBJECT_ID('TamerInventory', 'U') IS NULL
-CREATE TABLE TamerInventory (
-    InventoryID INT IDENTITY(1,1) PRIMARY KEY,
-    TamerID INT NOT NULL FOREIGN KEY REFERENCES Tamers(TamerID),
-    ItemType VARCHAR(16) NOT NULL,
-    ItemID INT NOT NULL,
-    Quantity INT NOT NULL DEFAULT 1,
-    IsTradeable BIT NOT NULL DEFAULT 1,
-    CONSTRAINT UQ_Tamer_Item UNIQUE (TamerID, ItemType, ItemID)
-);
-
-IF OBJECT_ID('TamerProsperityFlags', 'U') IS NULL
-CREATE TABLE TamerProsperityFlags (
-    TamerID INT NOT NULL FOREIGN KEY REFERENCES Tamers(TamerID),
-    RecruitedDigimonID INT NOT NULL,
-    ProsperityValue INT NOT NULL,
-    UnlockedAt DATETIME2 DEFAULT GETDATE(),
+CREATE TABLE IF NOT EXISTS TamerProsperityFlags (
+    TamerID            INTEGER NOT NULL REFERENCES Tamers(TamerID),
+    RecruitedDigimonID INTEGER NOT NULL,
+    ProsperityValue    INTEGER NOT NULL,
+    UnlockedAt         TEXT DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (TamerID, RecruitedDigimonID)
 );
 
-IF OBJECT_ID('TamerBossClears', 'U') IS NULL
-CREATE TABLE TamerBossClears (
-    TamerID INT NOT NULL FOREIGN KEY REFERENCES Tamers(TamerID),
-    BossEventID INT NOT NULL,
-    ClearMode VARCHAR(10) NOT NULL,
-    PartySize INT NOT NULL DEFAULT 1,
-    ClearedAt DATETIME2 DEFAULT GETDATE(),
+CREATE TABLE IF NOT EXISTS TamerBossClears (
+    TamerID     INTEGER NOT NULL REFERENCES Tamers(TamerID),
+    BossEventID INTEGER NOT NULL,
+    ClearMode   TEXT NOT NULL,
+    PartySize   INTEGER NOT NULL DEFAULT 1,
+    ClearedAt   TEXT DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (TamerID, BossEventID)
 );
-GO
