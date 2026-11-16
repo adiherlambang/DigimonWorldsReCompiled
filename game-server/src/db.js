@@ -33,6 +33,10 @@ function createStore(db) {
     flags: db.prepare('SELECT RecruitedDigimonID, ProsperityValue FROM TamerProsperityFlags WHERE TamerID = ?'),
     bossClears: db.prepare('SELECT BossEventID, ClearMode, PartySize FROM TamerBossClears WHERE TamerID = ?'),
     inventory: db.prepare('SELECT ItemType, ItemID, Quantity, IsTradeable FROM TamerInventory WHERE TamerID = ?'),
+    saveLatest: db.prepare('SELECT Version, Sha256, UsedBlocks, HasGameSave, UploadedAt, Data FROM TamerSaves WHERE TamerID = ? AND Slot = ? ORDER BY Version DESC LIMIT 1'),
+    saveList: db.prepare('SELECT Slot, Version, Sha256, UsedBlocks, HasGameSave, UploadedAt FROM TamerSaves t WHERE TamerID = ? AND Version = (SELECT MAX(Version) FROM TamerSaves WHERE TamerID = t.TamerID AND Slot = t.Slot) ORDER BY Slot'),
+    saveInsert: db.prepare('INSERT INTO TamerSaves (TamerID, Slot, Version, Data, Sha256, UsedBlocks, HasGameSave) VALUES (?, ?, ?, ?, ?, ?, ?)'),
+    savePrune: db.prepare('DELETE FROM TamerSaves WHERE TamerID = ? AND Slot = ? AND Version <= ?'),
     savePos: db.prepare('UPDATE Tamers SET CurrentMapID = ?, PosX = ?, PosY = ?, PosZ = ? WHERE TamerID = ?'),
   };
 
@@ -74,6 +78,31 @@ function createStore(db) {
         bossClears: q.bossClears.all(tamer.TamerID),
         inventory: q.inventory.all(tamer.TamerID),
       };
+    },
+
+    // ---- memory card tiap Tamer (berversi) ----
+    listSaves: (tamerId) => q.saveList.all(tamerId),
+    getSave: (tamerId, slot) => q.saveLatest.get(tamerId, slot) || null,
+
+    // Simpan versi baru bila `baseVersion` masih versi terbaru di server.
+    // -> { ok: true, version, unchanged } | { ok: false, code, current }
+    putSave(tamerId, slot, baseVersion, data, sha256, info, keep) {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const cur = q.saveLatest.get(tamerId, slot);
+        const curVersion = cur ? cur.Version : 0;
+        if (cur && cur.Sha256 === sha256) { db.exec('COMMIT'); return { ok: true, version: curVersion, unchanged: true }; }
+        if (curVersion !== baseVersion) { db.exec('COMMIT'); return { ok: false, code: 'CONFLICT', current: cur ? { version: cur.Version, sha256: cur.Sha256 } : { version: 0, sha256: null } }; }
+        if (cur && cur.UsedBlocks > 0 && info.usedBlocks === 0) { db.exec('COMMIT'); return { ok: false, code: 'EMPTY_OVERWRITE', current: { version: cur.Version, sha256: cur.Sha256 } }; }
+        const version = curVersion + 1;
+        q.saveInsert.run(tamerId, slot, version, data, sha256, info.usedBlocks, info.hasGameSave ? 1 : 0);
+        q.savePrune.run(tamerId, slot, version - keep);
+        db.exec('COMMIT');
+        return { ok: true, version, unchanged: false };
+      } catch (err) {
+        try { db.exec('ROLLBACK'); } catch { /* sudah rollback */ }
+        throw err;
+      }
     },
 
     savePosition: (tamerId, mapId, x, y, z) => q.savePos.run(mapId, x, y, z, tamerId),

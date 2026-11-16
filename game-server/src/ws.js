@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const { DuplicateError } = require('./db');
 const { WindowCounter, TokenBucket } = require('./limiter');
 const { send } = require('./sessions');
+const { createSaveHandler } = require('./saves');
 
 const USERNAME_RE = /^[A-Za-z0-9_]{3,16}$/;
 const TAMER_RE = /^[A-Za-z0-9]+( [A-Za-z0-9]+)*$/; // tanpa spasi di tepi / spasi ganda
@@ -24,7 +25,8 @@ function validateCredentials(m, withTamer) {
 }
 
 function createWs(sessions, store, cfg, log, udpPortRef) {
-  const wss = new WebSocket.Server({ host: cfg.host, port: cfg.wsPort, maxPayload: 4096 });
+  const wss = new WebSocket.Server({ host: cfg.host, port: cfg.wsPort, maxPayload: cfg.maxWsPayload });
+  const saveHandlerFor = createSaveHandler(store, cfg, log);
   const loginFails = new WindowCounter(8, 10 * 60_000);   // 8 gagal / 10 menit / IP
   const registers = new WindowCounter(5, 60 * 60_000);    // 5 akun / jam / IP
   // Hash palsu agar waktu respon "user tidak ada" sama dengan "password salah".
@@ -95,17 +97,24 @@ function createWs(sessions, store, cfg, log, udpPortRef) {
     ws.isAlive = true;
     ws.busy = false;
     const budget = new TokenBucket(5, 10); // maks ~5 pesan/detik
+    const saveHandler = saveHandlerFor(TokenBucket);
     ws.on('pong', () => { ws.isAlive = true; });
     const authTimer = setTimeout(() => { if (!ws.session) ws.close(4001, 'auth timeout'); }, cfg.authTimeoutMs);
 
     ws.on('message', async (raw, isBinary) => {
       if (isBinary) return ws.close(1003, 'binary tidak didukung');
+      // Pesan besar (memory card) hanya untuk yang sudah login.
+      if (!ws.session && raw.length > cfg.preAuthMaxPayload) return ws.close(1009, 'pesan terlalu besar');
       if (!budget.take()) return fail(ws, 'RATE_LIMITED', 'Terlalu cepat.');
       let m;
       try { m = JSON.parse(raw.toString('utf8')); } catch { return fail(ws, 'BAD_JSON', 'JSON tidak valid.'); }
       if (!m || typeof m !== 'object' || typeof m.type !== 'string') return fail(ws, 'BAD_MESSAGE', 'Pesan tidak valid.');
 
       if (m.type === 'PING') return send(ws, { type: 'PONG' });
+      if (m.type.startsWith('SAVE_')) {
+        if (!ws.session) return fail(ws, 'NOT_LOGGED_IN', 'Login dulu.');
+        return saveHandler(ws, m);
+      }
       if (m.type !== 'LOGIN' && m.type !== 'REGISTER') return fail(ws, 'UNKNOWN_TYPE', 'Tipe pesan tidak dikenal.');
       if (ws.session) return fail(ws, 'ALREADY_LOGGED_IN', 'Sudah login.');
       if (ws.busy) return fail(ws, 'BUSY', 'Permintaan sebelumnya masih diproses.');

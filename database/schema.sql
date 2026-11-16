@@ -71,3 +71,17 @@ CREATE TABLE IF NOT EXISTS TamerBossClears (
     ClearedAt   TEXT DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (TamerID, BossEventID)
 );
+
+-- Memory card (128 KiB) tiap Tamer, per slot kartu, berversi. Server menyimpan
+-- beberapa versi terakhir supaya save yang rusak bisa dikembalikan.
+CREATE TABLE IF NOT EXISTS TamerSaves (
+    TamerID     INTEGER NOT NULL REFERENCES Tamers(TamerID),
+    Slot        INTEGER NOT NULL CHECK (Slot IN (1, 2)),
+    Version     INTEGER NOT NULL,
+    Data        BLOB NOT NULL,
+    Sha256      TEXT NOT NULL,
+    UsedBlocks  INTEGER NOT NULL DEFAULT 0,
+    HasGameSave INTEGER NOT NULL DEFAULT 0,
+    UploadedAt  TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (TamerID, Slot, Version)
+);

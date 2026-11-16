@@ -241,3 +241,154 @@ test('pesan WS sebelum login: JSON rusak, tipe asing, biner', () => withServer(a
   a.send({ type: 'HACK' }); assert.equal((await a.next('ERROR')).code, 'UNKNOWN_TYPE');
   a.send({ type: 'PING' }); assert.equal((await a.next('PONG')).type, 'PONG');
 }));
+
+// ---------------------------------------------------------------------------
+// Memory card per Tamer (SAVE_LIST / SAVE_GET / SAVE_PUT)
+// ---------------------------------------------------------------------------
+const crypto = require('node:crypto');
+
+let rpcId = 0;
+function rpc(c, msg, ms = 3000) {
+  const reqId = ++rpcId;
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => { c.ws.off('message', h); reject(new Error(`timeout ${msg.type}`)); }, ms);
+    const h = (raw) => {
+      const m = JSON.parse(raw.toString());
+      if (m.reqId === reqId) { clearTimeout(t); c.ws.off('message', h); resolve(m); }
+    };
+    c.ws.on('message', h);
+    c.send({ ...msg, reqId });
+  });
+}
+
+const xor127 = (b, off) => { let x = 0; for (let i = 0; i < 127; i++) x ^= b[off + i]; return x; };
+
+// Kartu terformat seperti `MemoryCard::new_formatted()`; `game` = isi blok 1 dengan save Digimon World.
+function makeCard({ game = false, marker = 0 } = {}) {
+  const b = Buffer.alloc(131072);
+  b[0] = 0x4d; b[1] = 0x43; b[127] = xor127(b, 0);
+  for (let i = 1; i < 16; i++) { b[i * 128] = 0xa0; b[i * 128 + 8] = 0xff; b[i * 128 + 9] = 0xff; b[i * 128 + 127] = xor127(b, i * 128); }
+  if (game) {
+    b[128] = 0x51;
+    b.write('BASLUS-01032DIGIMON', 128 + 0x0a, 'latin1');
+    b[128 + 127] = xor127(b, 128);
+  }
+  b[8192] = marker; // isi blok data: membedakan satu save dari yang lain
+  return b;
+}
+const shaOf = (b) => crypto.createHash('sha256').update(b).digest('hex');
+const put = (c, slot, baseVersion, card, over = {}) =>
+  rpc(c, { type: 'SAVE_PUT', slot, baseVersion, sha256: shaOf(card), data: card.toString('base64'), ...over });
+
+test('save: unggah, tarik, versi naik, data sama tidak membuat versi baru', () => withServer(async (srv, mk) => {
+  const c = mk();
+  await c.auth('REGISTER', 'saver_one', 'password123', 'Saver One');
+  const empty = await rpc(c, { type: 'SAVE_LIST' });
+  assert.deepEqual(empty.saves, []);
+  assert.equal((await rpc(c, { type: 'SAVE_GET', slot: 1 })).code, 'NO_SAVE');
+
+  const v1 = makeCard({ game: true, marker: 1 });
+  const ok1 = await put(c, 1, 0, v1);
+  assert.equal(ok1.type, 'SAVE_OK'); assert.equal(ok1.version, 1); assert.equal(ok1.unchanged, false);
+  const again = await put(c, 1, 1, v1);
+  assert.equal(again.type, 'SAVE_OK'); assert.equal(again.version, 1); assert.equal(again.unchanged, true);
+
+  const v2 = makeCard({ game: true, marker: 2 });
+  assert.equal((await put(c, 1, 1, v2)).version, 2);
+
+  const got = await rpc(c, { type: 'SAVE_GET', slot: 1 });
+  assert.equal(got.type, 'SAVE_DATA'); assert.equal(got.version, 2);
+  assert.ok(Buffer.from(got.data, 'base64').equals(v2));
+  assert.equal(got.sha256, shaOf(v2));
+
+  const list = await rpc(c, { type: 'SAVE_LIST' });
+  assert.equal(list.saves.length, 1);
+  assert.deepEqual([list.saves[0].slot, list.saves[0].version, list.saves[0].hasGameSave, list.saves[0].usedBlocks], [1, 2, true, 1]);
+}));
+
+test('save: versi basi ditolak (CONFLICT), versi server tidak berubah', () => withServer(async (srv, mk) => {
+  const c = mk();
+  await c.auth('REGISTER', 'saver_two', 'password123', 'Saver Two');
+  await put(c, 1, 0, makeCard({ game: true, marker: 1 }));
+  await put(c, 1, 1, makeCard({ game: true, marker: 2 }));
+  const stale = await put(c, 1, 1, makeCard({ game: true, marker: 9 }));
+  assert.equal(stale.type, 'SAVE_REJECTED'); assert.equal(stale.code, 'CONFLICT'); assert.equal(stale.version, 2);
+  const first = await put(c, 1, 0, makeCard({ game: true, marker: 7 })); // klien baru yang belum pernah menarik
+  assert.equal(first.code, 'CONFLICT');
+  assert.equal((await rpc(c, { type: 'SAVE_GET', slot: 1 })).version, 2);
+}));
+
+test('save: kartu rusak ditolak (ukuran, header, hash), slot tidak valid', () => withServer(async (srv, mk) => {
+  const c = mk();
+  await c.auth('REGISTER', 'saver_three', 'password123', 'Saver Three');
+  const good = makeCard({ game: true });
+  const short = good.subarray(0, 1000);
+  assert.equal((await put(c, 1, 0, Buffer.from(short))).code, 'BAD_SIZE');
+  const noMagic = Buffer.from(good); noMagic[0] = 0x00;
+  assert.equal((await put(c, 1, 0, noMagic)).code, 'BAD_FORMAT');
+  assert.equal((await put(c, 1, 0, good, { sha256: 'a'.repeat(64) })).code, 'BAD_HASH');
+  assert.equal((await put(c, 3, 0, good)).code, 'BAD_REQUEST');
+  assert.equal((await put(c, 1, 0, good, { data: '***bukan base64***' })).code, 'BAD_SIZE');
+  assert.deepEqual((await rpc(c, { type: 'SAVE_LIST' })).saves, [], 'tidak ada yang tersimpan dari unggahan buruk');
+}));
+
+test('save: kartu kosong tidak boleh menimpa kartu yang berisi', () => withServer(async (srv, mk) => {
+  const c = mk();
+  await c.auth('REGISTER', 'saver_four', 'password123', 'Saver Four');
+  await put(c, 1, 0, makeCard({ game: true, marker: 1 }));
+  const wipe = await put(c, 1, 1, makeCard({ game: false, marker: 5 }));
+  assert.equal(wipe.code, 'EMPTY_OVERWRITE');
+  assert.equal((await rpc(c, { type: 'SAVE_GET', slot: 1 })).version, 1);
+}));
+
+test('save: milik Tamer sendiri, bertahan antar login, dua slot terpisah', () => withServer(async (srv, mk) => {
+  const a = mk();
+  await a.auth('REGISTER', 'saver_five', 'password123', 'Saver Five');
+  const cardA = makeCard({ game: true, marker: 11 });
+  const cardA2 = makeCard({ game: true, marker: 12 });
+  await put(a, 1, 0, cardA);
+  await put(a, 2, 0, cardA2);
+  a.close();
+
+  const b = mk();
+  await b.auth('REGISTER', 'saver_six', 'password123', 'Saver Six');
+  assert.deepEqual((await rpc(b, { type: 'SAVE_LIST' })).saves, [], 'akun lain tidak melihat save orang lain');
+  assert.equal((await rpc(b, { type: 'SAVE_GET', slot: 1 })).code, 'NO_SAVE');
+
+  const a2 = mk();
+  const login = await a2.auth('LOGIN', 'saver_five', 'password123');
+  assert.equal(login.type, 'LOGIN_SUCCESS');
+  const list = await rpc(a2, { type: 'SAVE_LIST' });
+  assert.deepEqual(list.saves.map((s) => [s.slot, s.version]), [[1, 1], [2, 1]]);
+  assert.ok(Buffer.from((await rpc(a2, { type: 'SAVE_GET', slot: 2 })).data, 'base64').equals(cardA2));
+}));
+
+test('save: hanya versi terakhir yang disimpan (saveVersionsKept)', () => withServer(async (srv, mk) => {
+  const c = mk();
+  await c.auth('REGISTER', 'saver_seven', 'password123', 'Saver Seven');
+  for (let i = 0; i < 3; i++) assert.equal((await put(c, 1, i, makeCard({ game: true, marker: i + 1 }))).version, i + 1);
+  const rows = srv.db.prepare('SELECT Version FROM TamerSaves ORDER BY Version').all().map((r) => r.Version);
+  assert.deepEqual(rows, [2, 3]);
+}, { saveVersionsKept: 2 }));
+
+test('save: batas unggah per koneksi (RATE_LIMITED)', () => withServer(async (srv, mk) => {
+  const c = mk();
+  await c.auth('REGISTER', 'saver_eight', 'password123', 'Saver Eight');
+  let limited = false;
+  for (let i = 0; i < 8 && !limited; i++) {
+    const r = await put(c, 1, i, makeCard({ game: true, marker: i + 1 }));
+    if (r.code === 'RATE_LIMITED') limited = true;
+  }
+  assert.ok(limited, 'unggahan beruntun harus dibatasi');
+}));
+
+test('save: sebelum login ditolak, dan pesan besar sebelum login memutus koneksi', () => withServer(async (srv, mk) => {
+  const c = mk();
+  await c.opened;
+  c.send({ type: 'SAVE_LIST', reqId: 1 });
+  const err = await c.next('ERROR');
+  assert.equal(err.code, 'NOT_LOGGED_IN');
+  const closed = new Promise((res) => c.ws.once('close', (code) => res(code)));
+  c.ws.send(JSON.stringify({ type: 'LOGIN', username: 'x'.repeat(10_000), password: 'y' }));
+  assert.equal(await closed, 1009);
+}));

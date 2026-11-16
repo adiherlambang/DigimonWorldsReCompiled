@@ -13,6 +13,9 @@ const DEFAULTS = {
   authTimeoutMs: 10_000,
   udpStaleMs: 10_000,
   persistIntervalMs: 30_000,
+  saveVersionsKept: 5,        // versi memory card terakhir yang disimpan per Tamer & slot
+  maxWsPayload: 256 * 1024,   // memory card 128 KiB dalam base64 + amplop JSON
+  preAuthMaxPayload: 4096,    // sebelum login pesan tidak boleh sebesar ini
   quiet: false,
 };
 
