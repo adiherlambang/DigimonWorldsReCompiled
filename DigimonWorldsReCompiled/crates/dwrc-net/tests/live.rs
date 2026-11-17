@@ -168,3 +168,80 @@ fn card_sync_vs_node_server() {
     assert!(!out_a2.lines[0].contains("berbeda dari server"), "{:?}", out_a2.lines);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+// ---------------------------------------------------------------------------
+// Server mati saat klien online. Tes ini menjalankan server Node sendiri (port 8080/7777),
+// jadi jangan dijalankan bersamaan dengan tes lain atau server yang sedang hidup:
+//   cargo test -p dwrc-net --test live server_ -- --ignored --test-threads=1 --nocapture
+// ---------------------------------------------------------------------------
+/// Mematikan server Node meski tes gagal di tengah jalan (supaya port 8080 tidak tersisa).
+struct ServerGuard(std::process::Child);
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_server() -> ServerGuard {
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", 8080)).is_err(),
+        "port 8080 sudah dipakai; matikan server lain dulu"
+    );
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../game-server");
+    let db = std::env::temp_dir().join(format!("dwrc-live-death-{}.sqlite", uniq()));
+    let child = std::process::Command::new("node")
+        .arg("server.js")
+        .current_dir(dir)
+        .env("DW1_DB_PATH", db)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("node server.js (sudah `npm install` di game-server?)");
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(10) {
+        if std::net::TcpStream::connect(("127.0.0.1", 8080)).is_ok() {
+            return ServerGuard(child);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut child = child;
+    let _ = child.kill();
+    panic!("server tidak mau naik");
+}
+
+#[test]
+#[ignore]
+fn server_killed_ends_session() {
+    let mut server = spawn_server();
+    let (sess, client) = NetClient::register("127.0.0.1", &format!("kd_{}", uniq()), "secret-pass-1", "Kill Test").expect("register");
+    wait_for("thread jaringan hidup", || client.shared.is_connected());
+    assert!(client.shared.end_reason().is_none());
+    let t = Instant::now();
+    server.0.kill().unwrap();
+    let _ = server.0.wait();
+    wait_for("sesi berakhir setelah server dimatikan", || client.shared.end_reason().is_some());
+    println!("server dimatikan -> sesi berakhir dalam {:?}: {:?}", t.elapsed(), client.shared.end_reason());
+    drop(sess);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore]
+fn server_frozen_ends_session() {
+    let server = spawn_server();
+    let (_s, client) = NetClient::register("127.0.0.1", &format!("fz_{}", uniq()), "secret-pass-1", "Freeze Test").expect("register");
+    wait_for("thread jaringan hidup", || client.shared.is_connected());
+    let pid = server.0.id().to_string();
+    // SIGSTOP: proses membeku, soket tetap terbuka (tidak ada FIN/RST) -- seperti kabel putus.
+    assert!(std::process::Command::new("kill").args(["-STOP", &pid]).status().unwrap().success());
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(70) && client.shared.end_reason().is_none() {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let reason = client.shared.end_reason();
+    let _ = std::process::Command::new("kill").args(["-CONT", &pid]).status();
+    println!("server membeku -> sesi berakhir dalam {:?}: {:?}", t.elapsed(), reason);
+    assert!(reason.is_some(), "klien harus sadar server tidak merespons");
+    assert!(t.elapsed() < Duration::from_secs(60));
+}

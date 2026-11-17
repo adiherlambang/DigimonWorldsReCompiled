@@ -14,10 +14,14 @@ use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tungstenite::{client::client, Error as WsError, Message, WebSocket};
 
 pub const WS_PORT: u16 = 8080;
+
+/// Server mengirim ping WebSocket tiap 15 detik. Bila tidak ada satu frame pun selama ini
+/// (server membeku atau jaringan putus tanpa menutup koneksi), sesi dianggap berakhir.
+const SILENCE_LIMIT: Duration = Duration::from_secs(40);
 
 pub struct NetClient {
     pub shared: Arc<NetShared>,
@@ -124,7 +128,12 @@ fn run(mut ws: WebSocket<TcpStream>, shared: Arc<NetShared>, stop: Arc<AtomicBoo
     shared.connected.store(true, Ordering::Relaxed);
     // reqId -> pengirim permintaan yang menunggu balasan.
     let mut pending: HashMap<u64, mpsc::Sender<Value>> = HashMap::new();
+    let mut last_rx = Instant::now();
     while !stop.load(Ordering::Relaxed) {
+        if last_rx.elapsed() > SILENCE_LIMIT {
+            shared.set_ended("Server tidak merespons (koneksi mati).");
+            break;
+        }
         while let Ok(req) = outbox.try_recv() {
             pending.insert(req.req_id, req.reply);
             match ws.send(Message::Text(req.text.into())) {
@@ -138,6 +147,7 @@ fn run(mut ws: WebSocket<TcpStream>, shared: Arc<NetShared>, stop: Arc<AtomicBoo
         }
         match ws.read() {
             Ok(Message::Text(t)) => {
+                last_rx = Instant::now();
                 let text = t.to_string();
                 let routed = serde_json::from_str::<Value>(&text)
                     .ok()
@@ -154,7 +164,7 @@ fn run(mut ws: WebSocket<TcpStream>, shared: Arc<NetShared>, stop: Arc<AtomicBoo
                 shared.set_ended("Server menutup koneksi.");
                 break;
             }
-            Ok(_) => {} // Ping/Pong ditangani tungstenite
+            Ok(_) => last_rx = Instant::now(), // Ping/Pong ditangani tungstenite; tanda server masih hidup
             Err(WsError::Io(e)) if is_timeout(&e) => {}
             Err(WsError::ConnectionClosed) | Err(WsError::AlreadyClosed) => {
                 shared.set_ended("Koneksi ke server terputus.");

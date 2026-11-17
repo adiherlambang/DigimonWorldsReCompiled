@@ -231,7 +231,12 @@ impl App {
         if let Some(emu) = &self.emu {
             *emu.shared.mmo_session.lock().unwrap() = self.mmo_session.clone();
         }
-        self.notify(format!("Sesi online berakhir: {reason}"), true);
+        let saved_note = if self.card_uploader.is_some() {
+            " Game tetap berjalan; save disimpan di komputer ini dan diunggah saat kamu online lagi."
+        } else {
+            " Game tetap berjalan dalam mode lokal."
+        };
+        self.notify(format!("Sesi online berakhir: {reason}.{saved_note}"), true);
     }
 
     fn stop_game(&mut self) {
