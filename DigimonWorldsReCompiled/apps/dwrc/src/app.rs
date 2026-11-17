@@ -1183,6 +1183,7 @@ impl App {
                     ui.set_min_width(260.0);
                     ui.label(RichText::new(&status.title).strong());
                     ui.label(RichText::new(format!("Engine: {} · BIOS: {}", status.engine, status.bios)).color(MUTED).small());
+                    ui.label(RichText::new(format!("Build {}", env!("DWRC_BUILD"))).color(MUTED).small());
                     if let Some(t) = &card_status {
                         ui.label(RichText::new(t).color(MUTED).small());
                     }

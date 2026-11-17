@@ -169,6 +169,7 @@ fn run(
     // DWRC_MAP_DEBUG=1 logs every change of the raw map byte (to find what rewrites it).
     let map_debug = std::env::var_os("DWRC_MAP_DEBUG").is_some();
     let mut last_raw_map: u8 = 0xFF;
+    let mut last_logged_stable: u16 = 0xFFFF;
     let udp_sock = UdpSocket::bind("0.0.0.0:0").ok();
     if let Some(ref s) = udp_sock { let _ = s.set_nonblocking(true); }
     let mut seq_gen = proto::SeqGen::new();
@@ -244,6 +245,10 @@ fn run(
             if let Some(stable_map) = map_filter.update(&tf, calm) {
                 tf.map_id = stable_map;
                 let area = dw1_ram::area_name_for(&session.psx.bus.ram, stable_map);
+                if map_debug && stable_map != last_logged_stable {
+                    map_debug_log(&format!("frame {frame_n}: map diterima 0x{stable_map:02X} = {area} @ ({},{},{})", tf.x, tf.y, tf.z));
+                    last_logged_stable = stable_map;
+                }
                 if sess.is_online {
                     if let (Some(sock), Some((_, _, addr))) = (&udp_sock, &udp_target) {
                         let pkt = proto::pack_sync(&tf, sess.session_id, &sess.session_key, seq_gen.next());
