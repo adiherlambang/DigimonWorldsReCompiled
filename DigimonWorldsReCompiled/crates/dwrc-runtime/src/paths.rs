@@ -48,6 +48,11 @@ impl Paths {
         self.root.join("library.json")
     }
 
+    /// Hasil alat riset (salinan RAM, ringkasan entitas).
+    pub fn research_dir(&self) -> PathBuf {
+        self.root.join("research")
+    }
+
     pub fn config_file(&self) -> PathBuf {
         self.root.join("settings.toml")
     }

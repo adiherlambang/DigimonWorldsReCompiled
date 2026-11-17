@@ -70,6 +70,8 @@ pub enum EmuCmd {
     /// A click on the picture: `u`, `v` from 0 to 1 across the console's
     /// 4:3 picture.
     Click { right: bool, u: f32, v: f32 },
+    /// Research: write the whole RAM and an entity summary into this folder.
+    DumpRam(std::path::PathBuf),
 }
 
 pub struct EmuHandle {
@@ -182,6 +184,13 @@ fn run(
                 EmuCmd::Key { key, shift, ctrl, alt } => session.key(&key, shift, ctrl, alt),
                 EmuCmd::Mouse(on) => session.set_mouse(on),
                 EmuCmd::Click { right, u, v } => session.click(right, u, v),
+                EmuCmd::DumpRam(dir) => {
+                    let msg = match research_dump(&session.psx.bus.ram, &dir) {
+                        Ok(p) => format!("RAM dump saved: {}", p.display()),
+                        Err(e) => format!("RAM dump failed: {e}"),
+                    };
+                    sh.notices.lock().unwrap().push(msg);
+                }
                 EmuCmd::Widescreen(w, ui) => {
                     session.set_widescreen(w, ui);
                     let mut st = sh.status.lock().unwrap();
@@ -305,4 +314,15 @@ fn map_debug_log(line: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("dwrc-map-debug.log") {
         let _ = writeln!(f, "[map] {line}");
     }
+}
+
+/// Writes `dump-<time>-map<XX>.ram` (all 2 MiB of console RAM) and `.txt` (decoded summary).
+fn research_dump(ram: &[u8], dir: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let map = dw1_ram::read_u8(ram, dw1_ram::slus_01032::CURRENT_MAP_ID);
+    let stem = dir.join(format!("dump-{ts}-map{map:02X}"));
+    std::fs::write(stem.with_extension("ram"), ram)?;
+    std::fs::write(stem.with_extension("txt"), dw1_ram::research_report(ram))?;
+    Ok(stem.with_extension("ram"))
 }

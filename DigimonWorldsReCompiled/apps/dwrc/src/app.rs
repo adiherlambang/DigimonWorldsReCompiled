@@ -963,7 +963,12 @@ impl App {
         let pad = self.input.poll(ctx, &self.cfg.input.keyboard, !overlay_open);
         let emu = self.emu.as_ref().unwrap();
         emu.set_pad(0, if overlay_open { Default::default() } else { pad });
-        let (esc, f12, tab) = ctx.input(|i| (i.key_pressed(Key::Escape), i.key_pressed(Key::F12), i.key_down(Key::Tab)));
+        let (esc, f12, f9, tab) =
+            ctx.input(|i| (i.key_pressed(Key::Escape), i.key_pressed(Key::F12), i.key_pressed(Key::F9), i.key_down(Key::Tab)));
+        // F9: research dump of the console RAM (only Digimon World 1 has a decoder for it).
+        if f9 && !overlay_open && emu.game == GameId::Dw1 {
+            emu.send(EmuCmd::DumpRam(self.paths.research_dir()));
+        }
         if esc {
             self.show_pause = !self.show_pause;
         }
@@ -980,7 +985,7 @@ impl App {
                         egui::Event::Key { key, physical_key, pressed: true, repeat: false, modifiers } => Some((physical_key.unwrap_or(*key), *modifiers)),
                         _ => None,
                     })
-                    .filter(|(k, _)| !matches!(k, Key::Escape | Key::F10 | Key::F11 | Key::F12 | Key::Tab))
+                    .filter(|(k, _)| !matches!(k, Key::Escape | Key::F9 | Key::F10 | Key::F11 | Key::F12 | Key::Tab))
                     .collect()
             });
             for (k, m) in keys {
@@ -1168,6 +1173,8 @@ impl App {
         if self.show_pause {
             let mut quit = false;
             let mut reset = false;
+            let mut dump = false;
+            let is_dw1 = self.emu.as_ref().is_some_and(|e| e.game == GameId::Dw1);
             egui::Window::new("Paused")
                 .collapsible(false)
                 .resizable(false)
@@ -1194,6 +1201,9 @@ impl App {
                     if b(ui, "Reset console") {
                         reset = true;
                     }
+                    if is_dw1 && b(ui, "Dump RAM for research (F9)") {
+                        dump = true;
+                    }
                     if b(ui, if self.fullscreen { "Leave fullscreen (F11)" } else { "Fullscreen (F11)" }) {
                         self.toggle_fullscreen(ctx);
                     }
@@ -1214,6 +1224,11 @@ impl App {
                     e.send(EmuCmd::Reset);
                 }
                 self.show_pause = false;
+            }
+            if dump {
+                if let Some(e) = &self.emu {
+                    e.send(EmuCmd::DumpRam(self.paths.research_dir()));
+                }
             }
             if quit {
                 self.stop_game();

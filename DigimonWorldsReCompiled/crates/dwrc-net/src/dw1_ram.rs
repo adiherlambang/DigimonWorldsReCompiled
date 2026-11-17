@@ -103,6 +103,86 @@ pub fn is_calm(ram: &[u8]) -> bool {
     !(0..4).any(|i| read_u16(ram, a::UI_BOX_DATA + i * a::UI_BOX_SIZE + 0x12) != 0)
 }
 
+/// Ringkasan teks untuk riset: menunjukkan di mana objek Tamer/partner berada di RAM, siapa saja yang
+/// menunjuk ke sana, dan objek lain yang tampak sejenis (kandidat NPC / entitas dunia).
+/// Dipakai bersama salinan RAM penuh (lihat `EmuCmd::DumpRam`); tidak mengubah apa pun.
+pub fn research_report(ram: &[u8]) -> String {
+    use slus_01032 as a;
+    use std::fmt::Write;
+    let mut s = String::new();
+    let hex_words = |ptr: u32, n: u32| -> String {
+        (0..n).map(|i| format!("{:08X}", read_u32(ram, ptr + i * 4))).collect::<Vec<_>>().join(" ")
+    };
+    let pos = |ptr: u32| (read_i32(ram, ptr + a::TRANSFORM_POS_X), read_i32(ram, ptr + a::TRANSFORM_POS_Y), read_i32(ram, ptr + a::TRANSFORM_POS_Z));
+
+    let _ = writeln!(s, "# DW1 RAM research dump");
+    let _ = writeln!(s, "raw_map_byte      = 0x{:02X}  (@0x{:08X})", read_u8(ram, a::CURRENT_MAP_ID), a::CURRENT_MAP_ID);
+    let _ = writeln!(s, "game_state        = {}", read_u8(ram, a::GAME_STATE));
+    let _ = writeln!(s, "is_in_menu        = {}", read_u32(ram, a::IS_IN_MENU));
+    let boxes: Vec<i16> = (0..4).map(|i| read_i16(ram, a::UI_BOX_DATA + i * a::UI_BOX_SIZE + 0x12)).collect();
+    let _ = writeln!(s, "ui_box_states     = {boxes:?}");
+    let _ = writeln!(s, "calm              = {}", is_calm(ram));
+
+    let tamer_ptr = read_u32(ram, a::TAMER_POS_STRUCT_PTR);
+    let partner_ptr = read_u32(ram, a::PARTNER_POS_STRUCT_PTR);
+    let _ = writeln!(s, "\n## Entitas Tamer @0x{:08X} dan partner @0x{:08X}", a::TAMER_ENTITY, a::PARTNER_ENTITY);
+    let _ = writeln!(s, "tamer_entity   : {}", hex_words(a::TAMER_ENTITY, 15));
+    let _ = writeln!(s, "partner_entity : {}", hex_words(a::PARTNER_ENTITY, 15));
+    for (name, ptr) in [("tamer", tamer_ptr), ("partner", partner_ptr)] {
+        if !is_valid_ps1_ptr(ptr) {
+            let _ = writeln!(s, "{name}_obj = 0x{ptr:08X} (bukan pointer RAM yang valid)");
+            continue;
+        }
+        let (x, y, z) = pos(ptr);
+        let _ = writeln!(s, "{name}_obj = 0x{ptr:08X} pos=({x},{y},{z}) yaw={} anim={}", read_i16(ram, ptr + a::TRANSFORM_YAW), read_u8(ram, ptr + a::ENT_ANIM_ID));
+        for row in 0..12u32 {
+            let _ = writeln!(s, "  +0x{:03X}: {}", row * 0x20, hex_words(ptr + row * 0x20, 8));
+        }
+    }
+
+    // Siapa yang menunjuk ke objek Tamer / partner? Biasanya daftar atau tabel objek dunia.
+    let scan_refs = |target: u32| -> Vec<u32> {
+        let mut v = Vec::new();
+        let mut off = 0usize;
+        while off + 4 <= ram.len() && v.len() < 40 {
+            if u32::from_le_bytes([ram[off], ram[off + 1], ram[off + 2], ram[off + 3]]) == target {
+                v.push(0x8000_0000 + off as u32);
+            }
+            off += 4;
+        }
+        v
+    };
+    for (name, ptr) in [("tamer", tamer_ptr), ("partner", partner_ptr)] {
+        if is_valid_ps1_ptr(ptr) {
+            let refs = scan_refs(ptr);
+            let _ = writeln!(s, "\n## Yang menunjuk ke {name}_obj (0x{ptr:08X}): {} lokasi", refs.len());
+            for r in refs {
+                let _ = writeln!(s, "  @0x{r:08X}: {}", hex_words(r.saturating_sub(16), 8));
+            }
+        }
+    }
+
+    // Objek lain yang kata pertamanya sama dengan objek Tamer: kandidat entitas sejenis.
+    if is_valid_ps1_ptr(tamer_ptr) {
+        let w0 = read_u32(ram, tamer_ptr);
+        if w0 != 0 {
+            let mut n = 0;
+            let _ = writeln!(s, "\n## Objek dengan kata pertama 0x{w0:08X} (sama dengan objek Tamer)");
+            let mut off = 0x1_0000usize;
+            while off + 4 <= ram.len() && n < 60 {
+                let addr = 0x8000_0000 + off as u32;
+                if addr != tamer_ptr && read_u32(ram, addr) == w0 {
+                    let (x, y, z) = pos(addr);
+                    let _ = writeln!(s, "  0x{addr:08X} pos=({x},{y},{z}) w1=0x{:08X}", read_u32(ram, addr + 4));
+                    n += 1;
+                }
+                off += 4;
+            }
+        }
+    }
+    s
+}
+
 pub fn extract_player_transform(ram: &[u8], player_id: u32, tamer_name: &str) -> crate::PlayerTransform {
     use slus_01032 as a;
 
@@ -197,6 +277,38 @@ mod tests {
         ram[(a::MAP_DATA_TABLE & PS1_RAM_MASK) as usize + 0xCC * 16 + 15] = 0;
         ram[(a::MAP_DATA_TABLE & PS1_RAM_MASK) as usize + 0x0B * 16 + 15] = 1;
         ram
+    }
+
+    #[test]
+    fn research_report_finds_objects_and_who_points_to_them() {
+        let mut ram = vec![0u8; 0x20_0000];
+        let w = |ram: &mut Vec<u8>, addr: u32, v: u32| {
+            let o = (addr & PS1_RAM_MASK) as usize;
+            ram[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        let tamer_obj = 0x8016_0000u32;
+        let sibling = 0x8016_1000u32;
+        w(&mut ram, a::TAMER_POS_STRUCT_PTR, tamer_obj);
+        w(&mut ram, tamer_obj, 0xDEAD_BEEF);
+        w(&mut ram, tamer_obj + a::TRANSFORM_POS_X, 653);
+        w(&mut ram, tamer_obj + a::TRANSFORM_POS_Z, 626);
+        w(&mut ram, sibling, 0xDEAD_BEEF);
+        w(&mut ram, sibling + a::TRANSFORM_POS_X, 111);
+        w(&mut ram, 0x8017_0000, tamer_obj); // sebuah daftar menunjuk ke objek Tamer
+        ram[(a::CURRENT_MAP_ID & PS1_RAM_MASK) as usize] = 0xCC;
+
+        let r = research_report(&ram);
+        assert!(r.contains("raw_map_byte      = 0xCC"), "{r}");
+        assert!(r.contains("tamer_obj = 0x80160000 pos=(653,0,626)"), "{r}");
+        assert!(r.contains("@0x80170000"), "penunjuk ke objek Tamer harus terdaftar:\n{r}");
+        assert!(r.contains("0x80161000 pos=(111,0,0)"), "objek sejenis harus terdaftar:\n{r}");
+    }
+
+    #[test]
+    fn research_report_survives_an_empty_ram() {
+        let r = research_report(&vec![0u8; 0x20_0000]);
+        assert!(r.contains("bukan pointer RAM yang valid"));
+        assert!(research_report(&[]).contains("DW1 RAM research dump"), "RAM kosong tidak boleh panik");
     }
 
     #[test]
